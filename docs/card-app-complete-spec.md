@@ -30,14 +30,14 @@ A cardholder-facing mobile app for a **single virtual card** issued through the 
 
 **It is not** a card-application product. Accounts are created by back-office and delivered as an invite. There is no signup, no KYC, no card issuance in-app.
 
-**It is a spending account, not just a card viewer.** The cardholder can add money, send payments, and receive them. Money movement is specified in [Part III](#part-iii--money-movement-s17s24). It extends the original PRD, which covered viewing and freezing only — the endpoints it needs do not exist yet, and the prerequisites are tracked in [Part X](#part-x--prerequisites-for-money-movement).
+**It is a spending account, not just a card viewer.** The cardholder can add money, send payments, and receive them. Money movement is specified in [Part III](#part-iii--money-movement-s17s24). Pismo platform support was verified on 2026-08-11 (PRD §14); the `/app/*` wrappers over it do not exist yet, and the remaining prerequisites are tracked in [Part X](#part-x--prerequisites-for-money-movement).
 
 ### The four things that define the design
 
 1. **One user ↔ one customer ↔ one account ↔ one active card.** Every screen assumes exactly one card. Multi-card is a v1.1 architectural change, not a UI tweak.
 2. **PAN and CVV are the crown jewels.** They exist in memory, for at most 90 seconds, on one screen, behind a biometric gate, with screenshots blocked. Everything else in the app shows masked data.
 3. **The backend derives identity from the session.** The app never sends an `account_id` or `customer_id`. It cannot address another user's card even if it tried.
-4. **Money leaving the account is irreversible.** Every outbound transfer passes step-up authentication, carries a client-generated idempotency key, and has an explicit unknown-outcome path. The app must never be able to send twice because a request timed out.
+4. **Money leaving the account is consequential, and only partly reversible.** Every outbound transfer passes step-up, carries a client-owned UUID `trackingId`, and has an explicit unknown-outcome path. Pismo deduplicates on that id, so a retry cannot double-send — but the app must still never *present* a replay as a second payment. In-platform authorizations can be cancelled; money on an external rail cannot be assumed recoverable.
 
 ---
 
@@ -496,9 +496,20 @@ Adding, sending, and receiving money. This section extends the original PRD, whi
 
 Money movement is different in kind from everything else in this app. Three rules govern the whole section.
 
-**1. Irreversibility drives the design.** A wrong tap on Freeze is undone by another tap. A wrong tap on Send may not be undoable at all. Every outbound flow therefore separates *composing* a transfer from *committing* it, with an explicit review step between them.
+**1. Consequence drives the design.** A wrong tap on Freeze is undone by another tap. A wrong tap on Send moves someone else's money. Every outbound flow therefore separates *composing* a transfer from *committing* it, with an explicit review step between them.
 
-**2. Idempotency is not optional.** The client generates an idempotency key when the user opens the review screen, and reuses that same key for every retry of that transfer. A request that times out after the server accepted it is the single most dangerous failure in the product — retrying without a key sends the money twice.
+Reversibility is real but partial. Pismo supports cancelling an approved authorization, in full or in part, and reports `CANCELLATION` / `PARTIAL_CANCELLATION` categories. So an in-platform transfer that has just been authorized **is** recoverable. Once money reaches an external rail, recovery depends on that rail rather than on Pismo. Design accordingly: do not tell the user something is final when it is not, and do not imply it can be clawed back when it cannot.
+
+**2. Idempotency is native — use it, do not reinvent it.** Pismo's *Create transfer* and *Create cash-in or cash-out* both **require** a `tracking_id` (36–50 chars, i.e. a UUID) and key deduplication on it:
+
+| Response | Meaning |
+|---|---|
+| **201** | New authorization created |
+| **200** | Existing authorization with that `tracking_id` returned |
+
+The client generates the UUID once when the review screen opens and reuses it for every retry of that transfer. **Re-sending is therefore inherently safe** — a timed-out request is recovered by sending the identical request again, and the 200-vs-201 distinction says whether it had already gone through. No bespoke reconciliation endpoint is needed.
+
+The `/app/*` layer passes the id through unchanged and must never generate one itself. The entire guarantee rests on the client owning it across retries.
 
 **3. Step-up authorizes every outbound movement.** Same gate as PAN reveal, and for the same reason: possession of an unlocked phone is not authorization to move money.
 
@@ -510,8 +521,9 @@ type TransferStatus =
   | 'PENDING'      // accepted, not yet settled
   | 'SETTLED'      // funds moved
   | 'RETURNED'     // rejected downstream, funds back
+  | 'CANCELLED'    // authorization cancelled, in full or in part
   | 'FAILED'       // never left
-  | 'UNKNOWN';     // client lost the outcome — must be reconciled, never retried blind
+  | 'UNKNOWN';     // client lost the outcome — resolve by re-sending the same trackingId
 
 interface Payee {
   id: string;
@@ -568,12 +580,15 @@ deletePayee(payeeId: string): Promise<void>;                     // DEL  /app/pa
 quoteTransfer(input: QuoteInput): Promise<TransferQuote>;        // POST /app/transfers/quote
 executeTransfer(                                                 // POST /app/transfers
   input: ExecuteInput,
-  idempotencyKey: string,
-): Promise<Transfer>;
+  trackingId: string,          // UUID, client-owned, stable across retries
+): Promise<{ transfer: Transfer; replayed: boolean }>;           // replayed === (HTTP 200)
 getTransfer(transferId: string): Promise<Transfer>;              // GET  /app/transfers/:id
+cancelTransfer(transferId: string): Promise<Transfer>;           // POST /app/transfers/:id/cancel
 getTopUpMethods(): Promise<TopUpMethod[]>;                       // GET  /app/topups/methods
-createTopUp(input: TopUpInput, idempotencyKey: string): Promise<Transfer>;  // POST /app/topups
+createTopUp(input: TopUpInput, trackingId: string): Promise<{ transfer: Transfer; replayed: boolean }>;
 ```
+
+`replayed` carries Pismo's 200-vs-201 distinction up to the UI. A replayed response means *this already happened* — S21 must render it as the original transfer, never as a second one.
 
 ---
 
@@ -679,7 +694,7 @@ sequenceDiagram
     participant L as AppLockProvider
     participant API as Backend
 
-    S->>S: generate idempotencyKey (once, on mount)
+    S->>S: generate trackingId UUID (once, on mount)
     S->>U: payee · amount · fee · total · quote expiry
     U->>S: Authorize
     alt Quote expired
@@ -689,25 +704,28 @@ sequenceDiagram
     end
     S->>L: stepUpWithBiometrics()
     L-->>S: authorized
-    S->>API: POST /app/transfers (Idempotency-Key)
-    alt Accepted
-        API-->>S: Transfer PENDING
+    S->>API: POST /app/transfers (trackingId)
+    alt 201 Created
+        API-->>S: new Transfer, PENDING
         S->>U: → S21 result
+    else 200 Replayed
+        API-->>S: the ORIGINAL authorization
+        S->>U: → S21 showing that transfer, not a new one
     else Rejected
         API-->>S: reason
         S->>U: → S19 with reason, amount preserved
     else Timeout / no response
-        S->>API: GET /app/transfers?idempotencyKey=…
-        Note over S,API: Reconcile — NEVER blind-retry
-        API-->>S: found → real status, or not found → safe to retry
+        Note over S,API: Re-send the identical request,<br/>same trackingId. Safe by construction —<br/>Pismo dedupes on it.
+        S->>API: POST /app/transfers (same trackingId)
+        API-->>S: 200 (already done) or 201 (was never received)
     end
 ```
 
 **Achieve:** Three things make this screen correct:
 
-1. **The idempotency key is generated once, on mount** — not per attempt. Every retry of *this* transfer carries the same key, so a duplicate submission is deduplicated server-side.
+1. **The `trackingId` is generated once, on mount** — not per attempt. Every retry of *this* transfer carries the same UUID, and Pismo deduplicates on it.
 2. **An expired quote forces re-confirmation.** Rates and fees change; silently executing against a stale quote debits an amount the user never saw.
-3. **Timeout triggers reconciliation, never a blind retry.** The client asks the server what happened to that idempotency key. Only a definitive "not found" makes a retry safe.
+3. **A timeout is resolved by re-sending, not by guessing.** Because the platform keys on `tracking_id`, the identical request is safe to repeat: 200 means it had already gone through and returns the original authorization, 201 means it genuinely had not. The dangerous version of this screen is one that generates a fresh key per attempt — that is what sends money twice.
 
 **Status:** Specified, not built
 
@@ -719,23 +737,29 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: accepted
+    [*] --> PENDING: 201 accepted
+    [*] --> PENDING: 200 replayed — same transfer
     PENDING --> SETTLED: funds delivered
     PENDING --> RETURNED: rejected downstream
+    PENDING --> CANCELLED: cancelled on platform
     PENDING --> FAILED: never left
-    [*] --> UNKNOWN: client lost the outcome
-    UNKNOWN --> PENDING: reconciled — it did go through
-    UNKNOWN --> FAILED: reconciled — it did not
+    [*] --> UNKNOWN: response lost
+    UNKNOWN --> PENDING: re-sent, 200 — it did go through
+    UNKNOWN --> PENDING: re-sent, 201 — now it has
     SETTLED --> [*]
     RETURNED --> [*]
+    CANCELLED --> [*]
     FAILED --> [*]
 ```
 
 **Achieve:** Each status gets distinct, honest copy. In particular:
 
 - **PENDING** must not read as "Sent." It is accepted, not delivered.
-- **UNKNOWN** must never be shown as either success or failure. It says the outcome is being confirmed, offers to check again, and does **not** offer a Send button.
-- **RETURNED** explains the money came back, and when.
+- **UNKNOWN** must never be shown as either success or failure. It says the outcome is being confirmed and offers to check again — which re-sends the same `trackingId` rather than composing anything new.
+- **A replayed (200) response renders as the original transfer**, with no hint that a second attempt occurred. The user made one payment; they should see one payment.
+- **RETURNED** explains the money came back, and when. **CANCELLED** distinguishes a cancellation from a downstream rejection — they mean different things to the user.
+
+Where the platform permits cancelling a recent authorization, this screen is where that action belongs.
 
 From here the user can view the transfer in history or return to the Pay hub.
 
@@ -769,7 +793,7 @@ flowchart TD
     F -->|No| G["Show limit"]
     F -->|Yes| H["Review"]
     H --> I["Step-up"]
-    I --> J["POST /topups (Idempotency-Key)"]
+    I --> J["POST /topups (trackingId)"]
     J --> K["→ S21 status"]
 
     style I fill:#0A2540,color:#fff
@@ -1022,7 +1046,8 @@ All 36 foreground/background pairs verified against WCAG AA in both themes.
 | **App-switcher snapshot on iOS** | No Expo API. Approximated with an `AppState` cover view. | Small native module during security hardening. |
 | **Certificate pinning** | Not implemented — belongs with real API integration. | Add when `http.ts` is wired. |
 | **Analytics** | Call sites marked `TODO(analytics)`; no SDK added. | Wire after integration, scrubbing per §9.5. |
-| **Money-movement endpoints do not exist** | Part III is fully specified but none of its 9 endpoints is implemented. UI can be built against the mock; it cannot function against the real backend. | Backend work per Part X. |
+| **Money-movement endpoints do not exist** | Part III is fully specified and the Pismo capability behind it is verified, but none of the `/app/*` wrappers is implemented. UI can be built against the mock; it cannot function against the real backend. | Backend work per Part X. |
+| **External rail undetermined for Hong Kong** | Pismo's documented instant rails are Pix (Brazil) and Faster Payments (UK). Internal transfers work regardless; cash-out to an external destination has no confirmed rail. | Part X item 3 — resolve before promising external payments. |
 | **Step-up strength for transfers** | Transfers inherit the same step-up mechanism as PAN reveal, which currently replays a stored password. Authorizing a payment this way is a worse trade than authorizing a card view. | Fix the step-up token issue (first row) **before** money movement ships, not after. |
 
 ---
@@ -1035,21 +1060,40 @@ Part III specifies the money-movement product. This part lists what has to be tr
 
 The PRD dated 2026-07-13 covers viewing and freezing only. Money movement appears nowhere in it — not in the in-scope list (§3), not in the deferred list, not in the traceability table (§13). Part III is a **deliberate extension** of that scope, agreed 2026-07-29. The PRD should be updated to match, or this document treated as superseding it for this feature.
 
+## Verified against Pismo, 2026-08-11
+
+Read directly from the developer documentation, including API reference pages. Full detail in **PRD §14**.
+
+| Capability | Result |
+|---|---|
+| Cash-in, cash-out, internal / P2P transfer | **Confirmed** — Payment methods API |
+| Payment requests (request money) | **Confirmed** — PENDING / PAID / EXPIRED, declinable, cancellable |
+| Settlement + reversal webhooks | **Confirmed** |
+| Idempotency | **Confirmed, native and mandatory** — `tracking_id`, 200 = replay, 201 = new |
+| Cancellation, full and partial | **Confirmed** — corrects an earlier assumption of irreversibility |
+| Pre-authorization | **Confirmed** — useful for cash-in |
+| Hold funds | **Confirmed** |
+
+Two design consequences already folded into Part III: the bespoke reconciliation endpoint was dropped in favour of Pismo's native `tracking_id` dedupe, and `CANCELLED` was added as a real transfer state.
+
 ## Open items, in dependency order
 
 | # | Item | Owner | Blocks |
 |---|---|---|---|
-| 1 | **Does the Pismo account type expose transfer capability?** If not, everything else is moot. | Backend / Pismo | Everything in Part III |
+| ~~1~~ | ~~Does Pismo expose transfer capability?~~ | — | **Answered: yes** |
 | 2 | **Regulatory posture.** Funds transfer is a money-transmission activity in a different compliance category from card viewing — licensing, KYC obligations, and transaction monitoring all change. | Legal / Compliance | Shipping, not building |
-| 3 | **The nine endpoints** in Part III, including server-side idempotency keyed on the client's `Idempotency-Key` header. | Backend | Real-data integration |
-| 4 | **Settlement notification** — webhook or polling — so PENDING transfers resolve without the user re-opening the app. | Backend | S21 status accuracy |
-| 5 | **Payee model.** Internal-only or external rails; where payees are stored; identifier validation and checksum rules. | Product / Backend | S18, S24 |
-| 6 | **Limits and fees.** Per-transaction, daily, monthly caps. FX handling if cross-currency. | Product | S19 |
+| 3 | **Which external rail applies to a Hong Kong deployment.** Documented instant rails are Pix (Brazil) and Faster Payments (UK, beta) — neither is Hong Kong, and HK's own FPS is a different scheme despite the shared name. Internal transfers are rail-independent, so **F11's internal path is unblocked and its cash-out path is not**. | Backend / Pismo | S18 external payees, cash-out |
+| 4 | **The `/app/*` wrapper contract** over the Payment methods API, passing `tracking_id` through unchanged and surfacing 200-vs-201 to the client. | Backend | Real-data integration |
+| 5 | **Payee book.** Pismo has no saved-payee concept — transfers address a destination directly. Storage, validation and masking are ours. | Backend | S18, S24 |
+| 6 | **Limit and fee values.** Pismo validates limits during authorization and exposes the configuration; the numbers are a product decision. | Product | S19 |
 | 7 | **Step-up hardening.** Transfers need authorization at least as strong as PAN reveal, which today replays a stored password. Resolve the Part IX first row **before** transfers ship. | Backend | S20 |
+| 8 | **Cancel window.** The platform permits cancelling recent authorizations. Whether to expose that to users, and for how long, is undecided. | Product | S21 |
+| 9 | **Payment-request reach.** Requests address a platform account id — peer-to-peer between platform users, not invoicing an arbitrary external payer. S22 must not imply otherwise. | Product | S22 |
+| 10 | **Amount conversion.** Pismo takes floats; our stack uses integer minor units. One conversion point, defined rounding, test coverage. | Backend | Correctness |
 
 ## What "cannot ship without" means concretely
 
-Items 1 and 2 are gates — if either fails, Part III does not ship in any form. Items 3–7 are contracts: the UI is written against assumptions in Part III, and each real answer that differs will change specific screens. The `Api` seam limits that blast radius to the service layer plus the affected screen, not the whole app.
+Item 2 is the remaining gate — if compliance does not clear, Part III does not ship in any form. Item 3 is a partial gate: it blocks external payees and cash-out, but not internal transfers, add money, or receive. Items 4–10 are contracts, and each real answer that differs from Part III's assumptions changes specific screens. The `Api` seam limits that blast radius to the service layer plus the affected screen, not the whole app.
 
 ## Front-end readiness
 

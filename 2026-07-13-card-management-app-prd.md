@@ -36,7 +36,7 @@ A mobile app that lets an existing cardholder view and manage the virtual card i
 | Card actions | View + **block/unblock (freeze/unfreeze)** |
 | Money movement | **In scope** — add money (cash-in), send (internal transfer + cash-out), receive (payment request). Verified against Pismo platform capability, §14 |
 | Transfer authorization | Step-up on **every** outbound movement, same gate as PAN reveal |
-| Duplicate protection | Client-generated `Idempotency-Key` per transfer, reused across retries |
+| Duplicate protection | Client-generated UUID `trackingId` per transfer, reused across retries; Pismo dedupes natively on it (§14) |
 | Push notifications | **Out of scope for MVP** (fast-follow v1.1) |
 
 ---
@@ -142,7 +142,8 @@ These four features were added 2026-08-11. All endpoint references are **provisi
 ### F10 — Add money (cash-in)
 - **AC1:** The user can see available funding methods and choose one. → `GET /app/topups/methods`
 - **AC2:** Amount entry validates against the method's limits before submission, showing the limit and what remains rather than a bare rejection.
-- **AC3:** Submission requires step-up and carries a client-generated `Idempotency-Key`. → `POST /app/topups`
+- **AC3:** Submission requires step-up and carries a client-generated UUID `trackingId`, with the same semantics as F11/AC7–AC8. → `POST /app/topups`
+- **AC6:** Where the funding source can fail after acceptance, use Pismo pre-authorization — for cash-in the financial impact lands only on confirmation, so the money cannot be spent before the source clears (§14).
 - **AC4:** Result routes to the transfer status view; the balance reflects the change once settled.
 - **AC5:** When no funding method is configured, an empty state explains this and offers support — not a dead end.
 
@@ -152,10 +153,11 @@ These four features were added 2026-08-11. All endpoint references are **provisi
 - **AC3:** Amount entry validates against available balance and per-transaction / daily limits, client-side for UX, server-side as the authority.
 - **AC4:** Fees and any FX are shown **before** the review screen, and the total debit is stated explicitly. → `POST /app/transfers/quote`
 - **AC5:** A quote that expires before authorization forces a re-quote and explicit re-confirmation of the changed figures. Executing against a stale quote is prohibited.
-- **AC6:** Authorization requires step-up. → `POST /app/transfers` with `Idempotency-Key`
-- **AC7:** The `Idempotency-Key` is generated once when the review screen opens and reused for every retry of that transfer.
-- **AC8:** On timeout or lost response, the client **reconciles against the idempotency key** and never blind-retries. → `GET /app/transfers?idempotencyKey=…`
+- **AC6:** Authorization requires step-up. → `POST /app/transfers` carrying `trackingId`
+- **AC7:** The client generates a UUID `trackingId` **once** when the review screen opens, and reuses it for every retry of that transfer. The `/app/*` layer passes it through to Pismo's `tracking_id` unchanged and never generates one itself — the guarantee depends on the client owning the id across retries (§14).
+- **AC8:** On timeout or lost response, the client **re-sends the identical request with the same `trackingId`**. This is inherently safe: Pismo returns the original authorization with **200** rather than creating a second one, and **201** means it is genuinely new. The app surfaces the distinction so a replay never reads as a second payment.
 - **AC9:** Outbound money movement is blocked while the card is blocked, with the reason shown.
+- **AC10:** Amounts cross the Pismo boundary as floats while our stack uses integer minor units. Conversion happens in one place in the `/app/*` layer, with defined rounding rules and test coverage (§14).
 
 ### F12 — Receive money
 - **AC1:** The user can view their account details for receiving funds. → `GET /app/account/details`
@@ -274,13 +276,13 @@ Each screen lists its purpose, key elements, non-happy states, and the backend e
 **Send money**
 1. S17 Pay → Send → S18 choose or add payee (new payee requires identifier confirmation).
 2. S19 amount + note; balance and limits validated live; `POST /app/transfers/quote` returns fee, FX and total debit.
-3. S20 review — `Idempotency-Key` generated **once on mount**. If the quote has expired, re-quote and require re-confirmation of the changed figures.
-4. Step-up → `POST /app/transfers` carrying that key.
-5. S21 status: PENDING → SETTLED / RETURNED / FAILED. On timeout, reconcile against the key via `GET /app/transfers?idempotencyKey=…` — never blind-retry.
+3. S20 review — UUID `trackingId` generated **once on mount**. If the quote has expired, re-quote and require re-confirmation of the changed figures.
+4. Step-up → `POST /app/transfers` carrying that `trackingId`.
+5. S21 status: PENDING → SETTLED / RETURNED / FAILED. On timeout, re-send the identical request with the same `trackingId`; a **200** means it already went through and returns the original authorization, a **201** means it is new.
 
 **Add money**
 1. S17 → Add money → S23 pick funding method → amount (validated against method limits) → review.
-2. Step-up → `POST /app/topups` with `Idempotency-Key` → S21 status.
+2. Step-up → `POST /app/topups` with the UUID `trackingId` → S21 status.
 
 **Receive money**
 1. S17 → Receive → S22 shows masked account details; full number revealed only behind step-up with screenshot blocking.
@@ -302,8 +304,8 @@ Each screen lists its purpose, key elements, non-happy states, and the backend e
 ### Money-movement security requirements
 
 8. **Step-up on every outbound movement.** Send and add-money both require step-up. Possession of an unlocked phone is not authorization to move money.
-9. **Idempotency is mandatory, client-side.** Every execute call carries a client-generated `Idempotency-Key`, created once per transfer attempt-set and reused across retries. The app must never issue an unkeyed transfer.
-10. **No blind retry.** A request that times out or loses its response must be reconciled against its idempotency key before any retry. A transfer whose outcome is unknown is displayed as unknown — never as success or failure.
+9. **Idempotency is mandatory and client-owned.** Every execute call carries a client-generated UUID `trackingId`, created once per transfer and reused across retries. The app must never issue a transfer without one, and no server layer may substitute its own — Pismo requires `tracking_id` (36–50 chars) and keys deduplication on it (§14).
+10. **Retry is safe, but the outcome must not be guessed.** Re-sending an identical request with the same `trackingId` cannot double-send: Pismo returns **200** with the original authorization, or **201** for a genuinely new one. Until the app has one of those responses, the transfer is displayed as *unknown* — never as success or failure.
 11. **Destination integrity.** New payee identifiers require confirmation (re-entry or checksum). Existing payee identifiers cannot be edited; changing a destination means delete-and-re-add so the confirmation always runs.
 12. **Account identifiers are sensitive.** The full receiving account number gets PAN-equivalent treatment: masked by default, revealed behind step-up, screenshot-blocked while revealed, clipboard auto-cleared. Masked everywhere else, including payee lists.
 13. **Blocked card blocks outbound money.** A frozen card that still permits transfers makes the freeze meaningless.
@@ -370,7 +372,7 @@ These `/app/*` wrappers do not exist yet. The Pismo capability behind each is co
 | Add money (F10) | `GET /app/topups/methods`, `POST /app/topups` | Payment methods API — create cash-in |
 | Send, internal (F11) | `POST /app/transfers/quote`, `POST /app/transfers` | Payment methods API — create transfer (account→account) |
 | Send, external (F11) | same, routed by payee kind | Payment methods API — create cash-out; regional rail |
-| Transfer status (F11) | `GET /app/transfers/:transferId`, `GET /app/transfers?idempotencyKey=` | Payment status + client webhooks |
+| Transfer status (F11) | `GET /app/transfers/:transferId` | Payment status + client webhooks. No reconciliation endpoint needed — re-sending the same `tracking_id` is the reconciliation (§14) |
 | Receive (F12) | `GET /app/account/details`, `POST /app/payment-requests` | Payment requests API; QR Code API where the rail supports it |
 | Payees (F13) | `GET/POST /app/payees`, `DELETE /app/payees/:payeeId` | No direct Pismo equivalent — **service-side concern** |
 
@@ -380,31 +382,69 @@ These `/app/*` wrappers do not exist yet. The Pismo capability behind each is co
 
 ## 14. Pismo platform verification (2026-08-11)
 
-Money movement was added to scope only after confirming the platform supports it. Findings below are from Pismo's published developer documentation.
+Money movement was added to scope only after confirming the platform supports it. Findings below were read directly from Pismo's developer documentation on 2026-08-11, including the API reference pages for the specific endpoints.
 
 ### Confirmed capabilities
 
 | Need | Pismo support | Notes |
 |---|---|---|
-| Money in | **Yes** — cash-in | Deposit to a platform account from an external environment |
-| Account-to-account | **Yes** — internal transfer | Between two platform accounts |
-| Money out | **Yes** — cash-out | Withdrawal from a platform account to an external environment |
-| Request money | **Yes** — Payment requests | Requires destination account id + amount; optional expiry and metadata. Can be accepted, declined by the receiver, or cancelled by the sender |
-| QR codes | **Yes, rail-dependent** | Dynamic QR Code API; BR Code / EMV format, tied to Pix |
-| Settlement notification | **Yes** — client webhooks | Events for payment received, and for reversals in both directions |
-| Idempotency | **Partial** | Present on some endpoints (e.g. an `Idempotency-Key` header on scheduled transfers, tracking-id dedupe on authorization). **Not confirmed as uniform across all payment endpoints** |
+| Money in | **Yes** — cash-in | *Create cash-in or cash-out*; direction set by processing code (credit = cash-in) |
+| Account-to-account | **Yes** — internal transfer / P2P | *Create transfer*, between two platform accounts |
+| Money out | **Yes** — cash-out | Same endpoint as cash-in, debit processing code |
+| Request money | **Yes** — Payment requests | `POST payments/v1/payment-requests`. Statuses PENDING / PAID / EXPIRED; declinable by receiver, cancellable by sender |
+| QR codes | **Yes, rail-dependent** | Dynamic QR Code API; BR Code / EMV format, documented in a Pix context |
+| Settlement notification | **Yes** — client webhooks | Payment-received and reversal events, both directions |
+| **Idempotency** | **Yes — native and mandatory** | See below. Better than assumed |
+| **Cancellation** | **Yes** | *Cancel transfer*, *Cancel cash-in or cash-out*; full and `PARTIAL_CANCELLATION` |
+| **Pre-authorization** | **Yes** | `pre_authorization: true`, then a confirm call |
+| **Hold funds** | **Yes** | Block, unblock, transfer, and cancel-transfer of held amounts |
+
+### Idempotency — resolved, and it changes our design
+
+Both *Create transfer* and *Create cash-in or cash-out* require a **`tracking_id`** body field — a string of length 36–50, i.e. a UUID, described as the unique tracking ID for the operation. The response codes make it an idempotency key outright:
+
+| Code | Meaning |
+|---|---|
+| **201** | New authorization created |
+| **200** | Request processed successfully; **existing authorization with the corresponding `tracking_id` returned** |
+| 409 | Conflict |
+
+**This is stronger than the design we had drafted.** We had planned a client-generated `Idempotency-Key` header plus a bespoke `/app/transfers?idempotencyKey=` reconciliation endpoint. Neither is needed:
+
+- The app generates a UUID `tracking_id` once per transfer and reuses it on every retry.
+- Re-sending the same `tracking_id` is **inherently safe** — the platform returns the original authorization with a 200 instead of creating a second one.
+- Reconciliation after a timeout is simply *re-sending the same request*. The 200/201 distinction tells us whether it had already gone through.
+
+The `/app/*` layer must pass `tracking_id` through unchanged and surface the 200-vs-201 distinction to the client. It must **not** generate the id itself — the whole guarantee depends on the client owning it across retries.
+
+### Cancellation — correction to an earlier assumption
+
+An earlier draft of the front-end spec asserted that an authorized transfer is irreversible. **That is too absolute.** Pismo supports cancelling approved authorizations, in full or in part, via *Cancel transfer* and *Cancel cash-in or cash-out*, and reports `CANCELLATION` / `PARTIAL_CANCELLATION` authorization categories.
+
+The user-facing design still treats **send as a considered action with a review step** — once money reaches an external rail, cancellation depends on that rail, not on Pismo. But an in-platform transfer that has just been authorized is recoverable, and the app should expose that rather than pretending otherwise. **Product decision needed:** whether to offer a cancel window on recent internal transfers.
+
+### Pre-authorization — worth using for cash-in
+
+`pre_authorization: true` defers the financial impact. For **credit pre-authorization (cash-in) the impact occurs only on confirmation**, which prevents the receiving party moving money before the funding source has cleared. This is the right pattern for F10 if the funding method can fail after acceptance.
 
 ### Which API to build against
 
-Pismo documents two generations. **Use the Payment methods API**, not the older Transfer funds endpoint — Pismo's own guidance is that new deployments should use it, and that new feature development lands only there. Its endpoints are operation-specific: *create cash-in or cash-out* (direction set by processing code) and *create transfer*.
+**Use the Payment methods API**, not the older *Transfer funds* endpoint. Pismo's guidance is explicit: it is recommended for all new deployments and all new feature development lands only there.
 
-### Open questions this verification did not resolve
+⚠️ **Documented inconsistency:** the Payment requests guide still shows confirmation via the legacy `POST payments/v1/payments` (*Transfer funds*) endpoint. Confirm with Pismo whether payment-request acceptance has a Payment methods API equivalent, or whether this one flow legitimately stays on the older endpoint.
 
-1. **Which external rail applies to a Hong Kong deployment.** The instant-payment rails documented are **Pix (Brazil)** and **Faster Payments (UK, beta)**. Neither is Hong Kong. Note that Hong Kong's own FPS shares a name with the UK system but is a different scheme — do not assume the UK integration covers it. Internal account-to-account transfers are rail-independent and unaffected. **This is the highest-priority question.**
-2. **Idempotency coverage.** Confirmed on some endpoints, not verified as platform-wide. If a given payment endpoint does not honour `Idempotency-Key`, our `/app/*` layer must implement dedupe itself — the client-side guarantee in F11/AC7–AC8 is not negotiable.
-3. **Whether QR is available off-Pix.** The QR Code API is documented in a Pix context. If the deployed rail is not Pix, F12/AC4 degrades to sharing account details and payment requests only.
-4. **Limits and fees** — per-transaction, daily, monthly — are configuration, not documented product behaviour. Product must define them.
+### Amounts are floats at the Pismo boundary
+
+Pismo takes `amount` as a **float** (`amount float required`; payment-request samples show `25.50`). Our stack uses **integer minor units** end to end, which stays correct — but the `/app/*` layer converts at the Pismo boundary, and that conversion is a rounding-risk seam. It needs explicit rounding rules and test coverage, not an inline `/100`.
+
+### Open questions still unresolved
+
+1. **Which external rail applies to a Hong Kong deployment.** The documented instant-payment rails are **Pix (Brazil)** and **Faster Payments (UK, beta)**. Neither is Hong Kong. Hong Kong's own FPS shares a name with the UK scheme while being a different system — the UK integration must not be assumed to cover it. Internal account-to-account transfers are rail-independent and unaffected, so F11's internal path is safe and its cash-out path is not yet. **Highest priority.**
+2. **Whether QR is available off-Pix.** If the deployed rail is not Pix, F12/AC4 degrades to account details and payment requests only.
+3. **Payment-request reach.** Payment requests address a **destination account id on the platform** — they are peer-to-peer between platform users, not a way to invoice an arbitrary external payer. F12 must not imply otherwise.
+4. **Limits and fees.** Pismo validates balances, limits and flexible transaction controls during authorization, and exposes account/program limit configuration — so limits are platform configuration rather than something we invent. The **values** are still a product decision.
 5. **Account-specific tokens.** Pismo documents endpoints requiring an account-specific token. How that maps onto our session-derived model (§9.6, where the app never sends an account id) needs design in the `/app/*` layer.
+6. **Cancel window.** See above — product decision on whether to expose it.
 
 ### What this changes
 
