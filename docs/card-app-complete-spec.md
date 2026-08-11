@@ -149,6 +149,8 @@ flowchart TD
     S23 --> S21
 
     S11 --> S12["S12 · Transaction detail"]
+    S11 --> S25["S25 · Statements<br/>choose period"]
+    S25 --> S26["S26 · Statement ready<br/>view · save · share"]
 
     S13 --> S14["S14 · Change password"]
     S13 --> S15["S15 · Settings"]
@@ -193,6 +195,8 @@ The two navy nodes are the step-up gates: **S9** before card credentials are sho
 | `/(app)/(pay)/payees` | S24 Manage payees | tab 2 |
 | `/(app)/(transactions)` | S11 | tab 3 |
 | `/(app)/(transactions)/[txnId]` | S12 | tab 3 |
+| `/(app)/(transactions)/statements` | S25 Statements | tab 3 |
+| `/(app)/(transactions)/statements/[statementId]` | S26 Statement ready | tab 3 |
 | `/(app)/(profile)` | S13 | tab 4 |
 | `/(app)/(profile)/change-password` | S14 | tab 4 |
 | `/(app)/(profile)/settings` | S15 | tab 4 |
@@ -817,9 +821,41 @@ Editing an existing payee's identifier is **not** supported. It is delete-and-re
 
 ---
 
-# Part IV — Transactions (S11–S12)
+# Part IV — Transactions and statements (S11–S12, S25–S26)
 
 Transfers and top-ups appear in this history alongside card transactions, distinguished by direction and type.
+
+## Statement types and API
+
+```ts
+type StatementFormat = 'PDF' | 'CSV';
+type StatementStatus = 'PENDING' | 'READY' | 'FAILED' | 'EXPIRED';
+
+interface Statement {
+  id: string;
+  from: IsoDate;
+  to: IsoDate;
+  format: StatementFormat;
+  status: StatementStatus;
+  transactionCount: number | null;   // null until READY
+  downloadUrl: string | null;        // short-lived, authenticated
+  expiresAt: IsoDateTime | null;
+  createdAt: IsoDateTime;
+  failureReason?: string;
+}
+```
+
+```ts
+requestStatement(input: {                       // POST /app/statements
+  from: IsoDate; to: IsoDate; format: StatementFormat;
+}): Promise<Statement>;
+getStatement(statementId: string): Promise<Statement>;   // GET /app/statements/:id
+listStatements(): Promise<Statement[]>;                  // GET /app/statements
+```
+
+**Bounds live in one place.** `MIN_STATEMENT_DAYS = 1` and `MAX_STATEMENT_DAYS = 365` are exported from `src/lib/statements.ts` alongside a `validateStatementRange(from, to)` that returns either the clamped range or a specific, user-facing reason. The UI and the mock both use it, and the server re-validates independently — client validation is UX, never the authority.
+
+**New dependency:** sharing a generated file needs `expo-sharing` (and `expo-file-system` to stage the download). Neither is installed yet.
 
 ## S11 · Transactions list
 
@@ -869,6 +905,78 @@ Amounts use tabular figures so digits do not shift while scrolling. Credits rend
 **Achieve:** Absent fields are **omitted, not rendered empty**. A PENDING transaction has no `authorizedAt`; a DECLINED one has no authorization code. Rendering "Authorization: null" is worse than rendering nothing.
 
 **Acceptance:** F7/AC4 · **Backend:** `GET /app/transactions` (item) · **Status:** **Built**
+
+---
+
+## S25 · Statements
+
+**Goal:** Produce a document the user can send to a landlord, an accountant, or a visa office — something that stands on its own away from the app.
+
+```mermaid
+flowchart TD
+    A["Statements"] --> B["Pick period"]
+    B --> C["Last 24 hours"]
+    B --> D["7 / 30 / 90 days"]
+    B --> E["Custom range"]
+    E --> F{Validate}
+    F -->|"< 24 hours"| G["'Minimum period is 24 hours'"]
+    F -->|"> 1 year"| H["'Maximum period is 1 year'<br/>show the furthest valid start"]
+    F -->|"end in future"| I["Clamp to today"]
+    F -->|"start before account opened"| J["Clamp + tell the user"]
+    F -->|ok| K["Choose PDF or CSV"]
+    C --> K
+    D --> K
+    K --> L["POST /app/statements"]
+    L --> M["Job accepted → S26"]
+    A --> N["Previous statements"]
+    N -->|"link still valid"| O["→ S26"]
+    N -->|"link expired"| P["Regenerate"]
+
+    style G fill:#C0362C,color:#fff
+    style H fill:#C0362C,color:#fff
+```
+
+### The two bounds
+
+| Bound | Value | Why |
+|---|---|---|
+| Minimum | **24 hours** | Below a day there is no meaningful opening/closing balance — Pismo's balance history is generated per daily cycle (PRD §14) |
+| Maximum | **1 year** (365 days) | A product decision, not a platform limit. Pismo permits three years; we cap at one to bound generation cost and document size |
+
+**Achieve:** Rejections state the limit **and** what would be valid — "Maximum period is 1 year; the earliest start date available is 12 Aug 2025" rather than "invalid range." A user asking for eighteen months wants a document, not a lecture.
+
+Presets cover the overwhelming majority of real requests; the custom range exists for the tax-year and visa-application cases that presets never fit.
+
+**Acceptance:** F14/AC1–AC3, AC7 · **Backend:** `POST /app/statements`, `GET /app/statements` · **Status:** Specified, not built
+
+---
+
+## S26 · Statement ready
+
+**Goal:** Hand over the finished document without trapping the user while it builds.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: job accepted
+    PENDING --> READY: rendered
+    PENDING --> FAILED: generation error
+    READY --> EXPIRED: link lifetime elapsed
+    EXPIRED --> PENDING: regenerate
+    FAILED --> PENDING: retry
+    READY --> [*]: viewed / saved / shared
+```
+
+**Achieve:** Generation is **asynchronous and leaveable**. A year of activity is thousands of rows; blocking the user behind a spinner for that is unacceptable, and a screen they cannot leave is worse. The job continues if they navigate away, and the statement appears in the list when done.
+
+Three details that matter:
+
+1. **An empty period still produces a valid statement.** Opening balance, closing balance, and a clear statement that there was no activity. That is a legitimate document — evidence of *no* activity is exactly what some requests need. It is not an error state.
+2. **Links expire.** A statement URL carries a full period of account history; it must not become a durable bearer token for that data. When a link has expired the answer is *regenerate*, presented plainly rather than as a failure.
+3. **The document is rendered server-side.** The app never assembles it. That keeps the format consistent across platforms, avoids shipping a PDF engine, and means a statement cannot be forged by a modified client.
+
+Save and share go through the OS share sheet. Files the user saves are **their** files — deliberate exports, not app cache.
+
+**Acceptance:** F14/AC4–AC6, AC8–AC10 · **Backend:** `GET /app/statements/:statementId` · **Status:** Specified, not built
 
 ---
 
@@ -1030,6 +1138,7 @@ All 36 foreground/background pairs verified against WCAG AA in both themes.
 | 8 | S16 states, a11y, simulator verification | States done; verification pending |
 | 9 | Money-movement service layer — types, 9 `Api` methods, mock, idempotency | **Not started** |
 | 10 | S17–S24 money-movement screens | **Not started** |
+| 11 | Statements — `src/lib/statements.ts` bounds + validation, 3 `Api` methods, S25–S26 | **Not started** |
 
 **Verification blocker:** no iOS simulator runtime is installed on the build machine. `xcodebuild -downloadPlatform iOS` is required before the app can be run and screenshotted.
 
@@ -1073,6 +1182,7 @@ Read directly from the developer documentation, including API reference pages. F
 | Cancellation, full and partial | **Confirmed** — corrects an earlier assumption of irreversibility |
 | Pre-authorization | **Confirmed** — useful for cash-in |
 | Hold funds | **Confirmed** |
+| Statement source data | **Confirmed** — `bank-statements/v1` balance history, `startDate`/`endDate`, max 3 years, cursor-paginated. Document rendering is ours |
 
 Two design consequences already folded into Part III: the bespoke reconciliation endpoint was dropped in favour of Pismo's native `tracking_id` dedupe, and `CANCELLED` was added as a real transfer state.
 
@@ -1090,6 +1200,8 @@ Two design consequences already folded into Part III: the bespoke reconciliation
 | 8 | **Cancel window.** The platform permits cancelling recent authorizations. Whether to expose that to users, and for how long, is undecided. | Product | S21 |
 | 9 | **Payment-request reach.** Requests address a platform account id — peer-to-peer between platform users, not invoicing an arbitrary external payer. S22 must not imply otherwise. | Product | S22 |
 | 10 | **Amount conversion.** Pismo takes floats; our stack uses integer minor units. One conversion point, defined rounding, test coverage. | Backend | Correctness |
+| 11 | **Statement rendering.** Pismo supplies balance history and transactions but has no "produce a PDF" endpoint. Composition, rendering, storage and link expiry are ours. | Backend | S25, S26 |
+| 12 | **Statement retention.** How long generated statements and their links remain available. | Product / Legal | S25 list, S26 expiry copy |
 
 ## What "cannot ship without" means concretely
 

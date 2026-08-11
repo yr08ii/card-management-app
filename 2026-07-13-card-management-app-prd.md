@@ -60,6 +60,7 @@ A mobile app that lets an existing cardholder view and manage the virtual card i
 12. **Receive money** — share account details, generate a payment request, and a QR code where the rail supports it
 13. **Payee management** — add, list, and remove saved payees
 14. **Transfer status tracking** — pending → settled / returned / failed, including reconciliation of unknown outcomes
+15. **Statements** — generate an account statement for a chosen period, minimum 24 hours and maximum 1 year, downloadable and shareable
 
 Money movement ships **after** items 1–9. It is a second release, not a reason to delay the first.
 
@@ -68,7 +69,7 @@ Money movement ships **after** items 1–9. It is a second release, not a reason
 - Multiple cards / multiple accounts per user (assumes **1 user ↔ 1 customer ↔ 1 account ↔ 1 active card**)
 - Push notifications / transaction alerts (v1.1) — **note:** this becomes materially more valuable once money movement ships, since inbound payments and settlement changes are exactly what warrants a notification
 - Self-service password reset (**gap — see §9**); routes to support / back-office re-invite
-- Spend limits editing, card PIN management, statements/PDF export, disputes, card replacement
+- Spend limits editing, card PIN management, disputes, card replacement
 - Scheduled and recurring transfers, bulk payments, standing orders
 - Cross-currency FX beyond what the configured rail provides natively
 
@@ -171,6 +172,20 @@ These four features were added 2026-08-11. All endpoint references are **provisi
 - **AC2:** Delete a payee, with confirmation.
 - **AC3:** Editing an existing payee's destination identifier is **not supported** — it is delete-and-re-add, so the F11/AC2 confirmation always runs against a new destination. Silently changing where money goes is a fraud vector.
 
+### F14 — Statements
+The user can produce a statement of account activity for a period they choose.
+
+- **AC1:** Period selection offers presets — **Last 24 hours**, Last 7 days, Last 30 days, Last 90 days — plus a custom range.
+- **AC2:** **Minimum period is 24 hours; maximum is 1 year (365 days).** Both bounds are enforced in the UI before submission and re-validated server-side. A range outside them states the limit and what would be valid, rather than failing generically.
+- **AC3:** The end date cannot be in the future, and the start date cannot precede account opening. Where the start precedes account opening, the range is clamped and the user is told.
+- **AC4:** A statement contains: account and holder identification, masked card identifier, the period covered, **opening balance, closing balance**, every transaction in the period in reverse-chronological order with date, description, direction and amount, and totals for money in and money out. → `POST /app/statements`
+- **AC5:** Generation is **asynchronous**. The request returns immediately with a job; the screen shows progress and the user may leave and come back. → `GET /app/statements/:statementId`
+- **AC6:** When ready, the statement can be viewed, saved, and shared through the OS share sheet. Formats: **PDF** (primary) and **CSV** (secondary, for reconciliation).
+- **AC7:** Previously generated statements are listed and re-downloadable while their links remain valid. → `GET /app/statements`
+- **AC8:** Download links are short-lived and authenticated. A statement URL must not be a bearer of long-lived access to account history.
+- **AC9:** Empty periods still produce a valid statement, showing opening and closing balances and stating that there was no activity. An empty statement is a legitimate document — it is evidence of no activity, not an error.
+- **AC10:** Statements are **rendered server-side**. The app never assembles the document itself.
+
 ---
 
 ## 6. Information architecture & navigation
@@ -247,6 +262,8 @@ Each screen lists its purpose, key elements, non-happy states, and the backend e
 | S22 | **Receive** | Get paid | Account details (masked, reveal behind step-up), payment request, QR where supported, copy/share | Reveal failure → dismiss; rail without QR hides that action | `GET /app/account/details`, `POST /app/payment-requests` |
 | S23 | **Add money** | Fund account | Funding method picker, amount, review, step-up | "No funding methods" empty → support | `GET /app/topups/methods`, `POST /app/topups` |
 | S24 | **Manage payees** | Keep list clean | Masked list, add, delete with confirm. No identifier editing | Empty state; delete error retry | `GET /app/payees`, `DELETE /app/payees/:payeeId` |
+| S25 | **Statements** | Choose a period | Presets (24 h / 7 d / 30 d / 90 d) + custom range, format (PDF / CSV), generate; list of previous statements | Range outside 24 h–1 year blocked with the limit stated; "No statements yet" empty | `POST /app/statements`, `GET /app/statements` |
+| S26 | **Statement ready** | Get the document | Generation progress, then period, transaction count, view / save / share | Generating (leaveable); failed → retry; link expired → regenerate | `GET /app/statements/:statementId` |
 
 ---
 
@@ -289,6 +306,13 @@ Each screen lists its purpose, key elements, non-happy states, and the backend e
 2. Optionally create a payment request (amount, expiry) or present a QR code where the rail supports one.
 3. Inbound settlement appears in S11 history.
 
+**Generate a statement**
+1. S11 Transactions (or S13 Profile) → Statements → S25.
+2. Pick a preset or a custom range. The UI enforces **≥ 24 hours and ≤ 1 year** before the request is allowed, and clamps a start date that precedes account opening.
+3. Choose PDF or CSV → `POST /app/statements` returns a job immediately.
+4. S26 shows progress. The user may leave; the job continues. → `GET /app/statements/:statementId`
+5. When ready: view, save, or share via the OS share sheet. Previously generated statements remain listed while their links are valid.
+
 ---
 
 ## 9. Security & privacy requirements
@@ -310,6 +334,7 @@ Each screen lists its purpose, key elements, non-happy states, and the backend e
 12. **Account identifiers are sensitive.** The full receiving account number gets PAN-equivalent treatment: masked by default, revealed behind step-up, screenshot-blocked while revealed, clipboard auto-cleared. Masked everywhere else, including payee lists.
 13. **Blocked card blocks outbound money.** A frozen card that still permits transfers makes the freeze meaningless.
 14. **Step-up hardening precedes launch.** Money movement must not ship on the password-replay step-up described in §8. See §14.
+15. **Statement links are short-lived and authenticated.** A statement URL contains a full period of account activity. It must not function as a long-lived bearer of that history, must not be guessable, and must expire. Statement files written to device storage are user-initiated saves, not app caches.
 
 ### Known gap — password reset
 The MVP backend has no self-service password-reset flow (only admin re-invite). The app's "Trouble signing in?" routes to a support/help screen for MVP. **Recommended fast-follow:** add `POST /app/auth/forgot-password` + `reset-password` to the backend and a reset flow to the app.
@@ -375,6 +400,7 @@ These `/app/*` wrappers do not exist yet. The Pismo capability behind each is co
 | Transfer status (F11) | `GET /app/transfers/:transferId` | Payment status + client webhooks. No reconciliation endpoint needed — re-sending the same `tracking_id` is the reconciliation (§14) |
 | Receive (F12) | `GET /app/account/details`, `POST /app/payment-requests` | Payment requests API; QR Code API where the rail supports it |
 | Payees (F13) | `GET/POST /app/payees`, `DELETE /app/payees/:payeeId` | No direct Pismo equivalent — **service-side concern** |
+| Statements (F14) | `POST /app/statements`, `GET /app/statements`, `GET /app/statements/:statementId` | `bank-statements/v1` account balance history for opening/closing balances + transaction listing; **rendering is ours** |
 
 **Note on payees:** Pismo transfers address a destination directly (`from` / `to` arrays containing account, card, merchant or custom info). There is no Pismo-side saved-payee concept. The payee book is therefore **our** service's responsibility — storage, validation and masking all sit in the `/app/*` layer, not in Pismo.
 
@@ -398,6 +424,7 @@ Money movement was added to scope only after confirming the platform supports it
 | **Cancellation** | **Yes** | *Cancel transfer*, *Cancel cash-in or cash-out*; full and `PARTIAL_CANCELLATION` |
 | **Pre-authorization** | **Yes** | `pre_authorization: true`, then a confirm call |
 | **Hold funds** | **Yes** | Block, unblock, transfer, and cancel-transfer of held amounts |
+| **Statement source data** | **Yes** | `bank-statements/v1` account balance history — see below |
 
 ### Idempotency — resolved, and it changes our design
 
@@ -426,6 +453,20 @@ The user-facing design still treats **send as a considered action with a review 
 ### Pre-authorization — worth using for cash-in
 
 `pre_authorization: true` defers the financial impact. For **credit pre-authorization (cash-in) the impact occurs only on confirmation**, which prevents the receiving party moving money before the funding source has cleared. This is the right pattern for F10 if the funding method can fail after acceptance.
+
+### Statements — source data confirmed, rendering is ours
+
+`GET bank-statements/v1/account-balances/{externalAccountId}/history` returns balance history for a transaction-banking account:
+
+- `startDate` / `endDate` query parameters
+- **Total range must not exceed three years** — our 1-year maximum sits comfortably inside it, so the cap is a product decision, not a platform limit
+- Cursor-paginated, `limit` default 100, maximum 500
+
+This supplies the **opening and closing balances** that make a statement a statement rather than a filtered transaction list. Transaction lines come from the existing history endpoint.
+
+**Two things Pismo does not give us.** First, **document rendering** — there is no "produce a PDF" endpoint, so composing and rendering the statement is our service's job. Second, be careful not to confuse this with Pismo's **Statement** APIs (`Get current statement`, `List statements`, `Statement minimum amount due`): those are **credit-card billing-cycle statements** with due dates and minimum payments, which is a different product concept. What F14 needs is an **activity statement over an arbitrary range**, built from balance history plus transactions.
+
+**Granularity caveat:** balance history is generated per configured **daily cycle**. A 24-hour statement therefore resolves to one full cycle-day, not an arbitrary intraday window. If a true intraday statement is ever required, opening and closing balances would have to be derived from transaction running totals instead.
 
 ### Which API to build against
 
