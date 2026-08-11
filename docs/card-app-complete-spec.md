@@ -30,6 +30,8 @@ A cardholder-facing mobile app for a **single virtual card** issued through the 
 
 **It is not** a card-application product. Accounts are created by back-office and delivered as an invite. There is no signup, no KYC, no card issuance in-app.
 
+**It is also not a wallet.** The app cannot send, receive, or transfer money — there is no such capability in the PRD or the API. The card is funded and administered on the Pismo side. See [Part IX](#part-ix--deferred-to-v11-money-movement).
+
 ### The three things that define the design
 
 1. **One user ↔ one customer ↔ one account ↔ one active card.** Every screen assumes exactly one card. Multi-card is a v1.1 architectural change, not a UI tweak.
@@ -675,6 +677,66 @@ All 36 foreground/background pairs verified against WCAG AA in both themes.
 | **App-switcher snapshot on iOS** | No Expo API. Approximated with an `AppState` cover view. | Small native module during security hardening. |
 | **Certificate pinning** | Not implemented — belongs with real API integration. | Add when `http.ts` is wired. |
 | **Analytics** | Call sites marked `TODO(analytics)`; no SDK added. | Wire after integration, scrubbing per §9.5. |
+| **No money movement** | The app cannot send, receive, or transfer funds. See Part IX. | Deferred to v1.1 pending the questions below. |
+
+---
+
+# Part IX — Deferred to v1.1: money movement
+
+**Status: out of MVP scope, deliberately.** Raised during design review 2026-07-29 and deferred.
+
+## Why it is absent today
+
+Money movement appears nowhere in the PRD dated 2026-07-13 — not in the in-scope list (§3), not in the deferred list, and not in the traceability table (§13). The API surface is thirteen methods, all read-only except `blockCard` / `unblockCard`:
+
+```
+acceptInvite · login · refresh · stepUp · changePassword · getMe
+getCards · getCard · getBalance · getSensitive · blockCard · unblockCard
+getTransactions
+```
+
+This follows from the product model. The card is funded and administered on the **Pismo** side; this app is a **viewer and control surface** over a card someone else issued. The PRD's target user is "an individual who has already been issued a virtual card." Adding transfers changes what the product *is*, not just what its home screen shows.
+
+Several reference mockups in `examples/` (bankly, Moneyfitch) show prominent Send / Receive / Add actions. Those are generic consumer-wallet designs and were not the basis for this scope.
+
+## What adding it would actually require
+
+This is a product surface comparable in size to everything built so far — not a button.
+
+```mermaid
+flowchart TD
+    A["Send money"] --> B["Select or add payee"]
+    B --> C["Amount + currency"]
+    C --> D{"Within limits?<br/>Sufficient balance?"}
+    D -->|No| E["Blocked with reason"]
+    D -->|Yes| F["Review + fees + FX"]
+    F --> G["Step-up authentication"]
+    G --> H["Submit transfer"]
+    H --> I{Result}
+    I -->|Accepted| J["Pending state<br/>+ tracking"]
+    I -->|Rejected| K["Reason + remediation"]
+    I -->|"Timeout / unknown"| L["Reconciliation<br/>must not double-send"]
+    J --> M["Settled / returned / reversed"]
+
+    style L fill:#C0362C,color:#fff
+    style G fill:#0A2540,color:#fff
+```
+
+**Blocking questions, in the order they need answering:**
+
+1. **Does the Pismo account type even expose transfer capability?** If not, everything below is moot. This is the first question to ask.
+2. **Regulatory posture.** Funds transfer is a money-transmission activity and sits in a different compliance category from card viewing. Licensing, KYC obligations, and transaction monitoring all change. This is a legal question before it is an engineering one.
+3. **Backend contract.** New endpoints (payees, quote, execute, status), idempotency keys so a retried request cannot double-send, and a webhook or polling path for asynchronous settlement.
+4. **Payee model.** Internal-only, or external rails? Saved payees, and where they are stored.
+5. **Limits and fees.** Per-transaction, daily, monthly. FX handling if cross-currency.
+6. **Failure semantics.** The unknown-outcome case in the diagram above is the hard one: a request that times out after the server accepted it must never be retried blindly.
+7. **Step-up.** Transfers need authorization at least as strong as PAN reveal — which inherits the limitation in Part VIII's first row and should be resolved first.
+
+## Front-end readiness
+
+The current architecture does not obstruct this. Screens compose against the `Api` interface, so transfers would arrive as new methods on that interface plus a new route group — no rework of what exists. The design system already carries the needed pieces: `BottomSheet` for confirmation, `Input` with validation, `Countdown` for step-up, `success`/`danger` tokens for result states.
+
+**Recommended sequencing:** answer question 1, then 2. If both clear, this becomes its own spec → plan → build cycle rather than an addition to the MVP.
 
 ---
 
