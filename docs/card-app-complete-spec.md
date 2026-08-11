@@ -30,13 +30,14 @@ A cardholder-facing mobile app for a **single virtual card** issued through the 
 
 **It is not** a card-application product. Accounts are created by back-office and delivered as an invite. There is no signup, no KYC, no card issuance in-app.
 
-**It is also not a wallet.** The app cannot send, receive, or transfer money — there is no such capability in the PRD or the API. The card is funded and administered on the Pismo side. See [Part IX](#part-ix--deferred-to-v11-money-movement).
+**It is a spending account, not just a card viewer.** The cardholder can add money, send payments, and receive them. Money movement is specified in [Part III](#part-iii--money-movement-s17s24). It extends the original PRD, which covered viewing and freezing only — the endpoints it needs do not exist yet, and the prerequisites are tracked in [Part X](#part-x--prerequisites-for-money-movement).
 
-### The three things that define the design
+### The four things that define the design
 
 1. **One user ↔ one customer ↔ one account ↔ one active card.** Every screen assumes exactly one card. Multi-card is a v1.1 architectural change, not a UI tweak.
 2. **PAN and CVV are the crown jewels.** They exist in memory, for at most 90 seconds, on one screen, behind a biometric gate, with screenshots blocked. Everything else in the app shows masked data.
 3. **The backend derives identity from the session.** The app never sends an `account_id` or `customer_id`. It cannot address another user's card even if it tried.
+4. **Money leaving the account is irreversible.** Every outbound transfer passes step-up authentication, carries a client-generated idempotency key, and has an explicit unknown-outcome path. The app must never be able to send twice because a request timed out.
 
 ---
 
@@ -47,12 +48,13 @@ flowchart TB
     subgraph UI["Screens — src/app/"]
         Auth["(auth) group<br/>S1–S6"]
         App["(app) group<br/>S7–S15"]
+        Pay["(pay) group<br/>S17–S24"]
     end
 
     subgraph Shared["Shared UI — src/components/"]
         Prim["ui/ — 15 primitives<br/>Button · Input · Sheet · Countdown …"]
         States["states/ — S16<br/>Error · Empty · Offline · SessionExpired"]
-        Feature["card/ · transactions/"]
+        Feature["card/ · transactions/ · pay/"]
     end
 
     subgraph Logic["Logic — src/providers, src/hooks, src/lib"]
@@ -63,7 +65,7 @@ flowchart TB
     end
 
     subgraph Data["Data — src/services/"]
-        Api["Api interface<br/>13 methods"]
+        Api["Api interface<br/>13 built + 9 for money movement"]
         Mock["mock/ — fixtures + scenarios"]
         Http["http/ — real backend (stub)"]
     end
@@ -118,9 +120,10 @@ flowchart TD
     S6 -->|"fallback"| PWD["Password unlock"]
     PWD --> HOME
 
-    subgraph HOME["Authenticated · 3-tab bar"]
+    subgraph HOME["Authenticated · 4-tab bar"]
         direction LR
-        S7["S7 · Home<br/>card overview"]
+        S7["S7 · Home<br/>card + balance"]
+        S17["S17 · Pay<br/>money hub"]
         S11["S11 · Transactions"]
         S13["S13 · Profile"]
     end
@@ -130,6 +133,20 @@ flowchart TD
     S8 --> S9["S9 · Reveal PAN/CVV"]
     S8 --> S10["S10 · Block / unblock<br/>confirm sheet"]
     S10 --> S7
+
+    S7 -.->|"Send · Receive · Add"| S17
+
+    S17 --> S18["S18 · Send<br/>choose payee"]
+    S17 --> S22["S22 · Receive<br/>account details · QR"]
+    S17 --> S23["S23 · Add money"]
+    S17 --> S24["S24 · Manage payees"]
+
+    S18 --> S19["S19 · Amount + note"]
+    S19 --> S20["S20 · Review + authorize<br/>step-up required"]
+    S20 --> S21["S21 · Transfer result"]
+    S21 -->|"pending / settled"| S11
+    S21 -->|"failed"| S19
+    S23 --> S21
 
     S11 --> S12["S12 · Transaction detail"]
 
@@ -145,9 +162,12 @@ flowchart TD
     BG(["Backgrounded > 2 min"]) --> S6
 
     style S9 fill:#0A2540,color:#fff
+    style S20 fill:#0A2540,color:#fff
     style SE fill:#C0362C,color:#fff
     style HOME fill:#F6F9FC
 ```
+
+The two navy nodes are the step-up gates: **S9** before card credentials are shown, **S20** before money leaves the account. Nothing sensitive or irreversible happens without passing one of them.
 
 ### Route map
 
@@ -163,13 +183,23 @@ flowchart TD
 | `/(app)/(home)` | S7 | tab 1 |
 | `/(app)/(home)/card/[cardId]` | S8 | tab 1 |
 | `/(app)/(home)/card/[cardId]/reveal` | S9 | tab 1, fullscreen modal |
-| `/(app)/(transactions)` | S11 | tab 2 |
-| `/(app)/(transactions)/[txnId]` | S12 | tab 2 |
-| `/(app)/(profile)` | S13 | tab 3 |
-| `/(app)/(profile)/change-password` | S14 | tab 3 |
-| `/(app)/(profile)/settings` | S15 | tab 3 |
+| `/(app)/(pay)` | S17 Pay hub | tab 2 |
+| `/(app)/(pay)/send` | S18 Choose payee | tab 2 |
+| `/(app)/(pay)/send/amount` | S19 Amount | tab 2 |
+| `/(app)/(pay)/send/review` | S20 Review + authorize | tab 2 |
+| `/(app)/(pay)/transfer/[transferId]` | S21 Result / status | tab 2 |
+| `/(app)/(pay)/receive` | S22 Receive | tab 2 |
+| `/(app)/(pay)/add-money` | S23 Add money | tab 2 |
+| `/(app)/(pay)/payees` | S24 Manage payees | tab 2 |
+| `/(app)/(transactions)` | S11 | tab 3 |
+| `/(app)/(transactions)/[txnId]` | S12 | tab 3 |
+| `/(app)/(profile)` | S13 | tab 4 |
+| `/(app)/(profile)/change-password` | S14 | tab 4 |
+| `/(app)/(profile)/settings` | S15 | tab 4 |
 
 S10 is a bottom sheet, not a route — it must open over both S7 and S8. S16 is a component set, not a route.
+
+**Tab icons:** Home `creditcard`, Pay `arrow.left.arrow.right`, Transactions `list.bullet`, Profile `person`.
 
 ---
 
@@ -343,6 +373,8 @@ flowchart TD
     F -->|BLOCKED| H["Grey gradient<br/>+ frost overlay<br/>+ 'Frozen' label"]
     G --> I["Quick actions"]
     H --> I
+    I -->|"Send"| N["→ S18"]
+    I -->|"Add money"| O["→ S23"]
     I -->|"Freeze / Unfreeze"| J["→ S10 sheet"]
     I -->|"Show number"| K["→ S9 reveal"]
     I -->|"Transactions"| L["→ S11"]
@@ -353,6 +385,8 @@ flowchart TD
 ```
 
 **Achieve:** The card tile is the hero object — it renders identically in light and dark, the way a physical card does. The **blocked state carries three simultaneous signals** (hue change, frost overlay, text label), because PRD F3/AC2 requires it be unmistakable and no single signal survives colour blindness, glare, and glanceability at once.
+
+Quick actions are shortcuts into the Pay hub, not a second implementation of it. **While the card is blocked, Send and Add money are disabled** with the reason shown — a freeze that still permits outbound money is not a freeze.
 
 **Acceptance:** F3/AC1, F3/AC2 · **Backend:** `GET /app/cards`, `GET /app/cards/balance` · **Status:** Partial — `CardArt` and `CardStatusBadge` built, screen is a stub
 
@@ -454,7 +488,314 @@ flowchart TD
 
 ---
 
-# Part III — Transactions (S11–S12)
+# Part III — Money movement (S17–S24)
+
+Adding, sending, and receiving money. This section extends the original PRD, which covered viewing and freezing only.
+
+## Principles
+
+Money movement is different in kind from everything else in this app. Three rules govern the whole section.
+
+**1. Irreversibility drives the design.** A wrong tap on Freeze is undone by another tap. A wrong tap on Send may not be undoable at all. Every outbound flow therefore separates *composing* a transfer from *committing* it, with an explicit review step between them.
+
+**2. Idempotency is not optional.** The client generates an idempotency key when the user opens the review screen, and reuses that same key for every retry of that transfer. A request that times out after the server accepted it is the single most dangerous failure in the product — retrying without a key sends the money twice.
+
+**3. Step-up authorizes every outbound movement.** Same gate as PAN reveal, and for the same reason: possession of an unlocked phone is not authorization to move money.
+
+## Data model additions
+
+```ts
+type PayeeKind = 'INTERNAL' | 'EXTERNAL_BANK';
+type TransferStatus =
+  | 'PENDING'      // accepted, not yet settled
+  | 'SETTLED'      // funds moved
+  | 'RETURNED'     // rejected downstream, funds back
+  | 'FAILED'       // never left
+  | 'UNKNOWN';     // client lost the outcome — must be reconciled, never retried blind
+
+interface Payee {
+  id: string;
+  kind: PayeeKind;
+  displayName: string;
+  maskedIdentifier: string;   // never the full account number in list views
+  currency: CurrencyCode;
+  createdAt: IsoDateTime;
+}
+
+interface TransferQuote {
+  quoteId: string;
+  amount: number;             // minor units, as everywhere else
+  fee: number;
+  fxRate?: number;
+  totalDebit: number;
+  currency: CurrencyCode;
+  expiresAt: IsoDateTime;     // quotes go stale; the review screen must respect this
+}
+
+interface Transfer {
+  id: string;
+  payeeId: string;
+  amount: number;
+  fee: number;
+  currency: CurrencyCode;
+  status: TransferStatus;
+  reference?: string;
+  note?: string;
+  createdAt: IsoDateTime;
+  settledAt: IsoDateTime | null;
+  failureReason?: string;
+}
+
+interface AccountDetails {           // for receiving
+  accountName: string;
+  maskedAccountNumber: string;
+  fullAccountNumber?: string;        // revealed on demand, same treatment as PAN
+  routingIdentifier?: string;
+  currency: CurrencyCode;
+  shareableText: string;
+}
+```
+
+## API additions
+
+Nine methods extend the `Api` interface. **None of these endpoints exists yet** — see [Part X](#part-x--prerequisites-for-money-movement).
+
+```ts
+getAccountDetails(): Promise<AccountDetails>;                    // GET  /app/account/details
+getPayees(): Promise<Payee[]>;                                   // GET  /app/payees
+addPayee(input: AddPayeeInput): Promise<Payee>;                  // POST /app/payees
+deletePayee(payeeId: string): Promise<void>;                     // DEL  /app/payees/:id
+quoteTransfer(input: QuoteInput): Promise<TransferQuote>;        // POST /app/transfers/quote
+executeTransfer(                                                 // POST /app/transfers
+  input: ExecuteInput,
+  idempotencyKey: string,
+): Promise<Transfer>;
+getTransfer(transferId: string): Promise<Transfer>;              // GET  /app/transfers/:id
+getTopUpMethods(): Promise<TopUpMethod[]>;                       // GET  /app/topups/methods
+createTopUp(input: TopUpInput, idempotencyKey: string): Promise<Transfer>;  // POST /app/topups
+```
+
+---
+
+## S17 · Pay hub
+
+**Goal:** One place that answers "what can I do with my money?" — and makes the three primary actions reachable in one tap.
+
+```mermaid
+flowchart TD
+    A["Pay tab"] --> B["Balance header<br/>available to spend"]
+    B --> C["Send"]
+    B --> D["Receive"]
+    B --> E["Add money"]
+    A --> F["Recent payees<br/>tap to repeat"]
+    A --> G["Pending transfers<br/>if any"]
+    A --> H["Manage payees"]
+
+    C --> I["→ S18"]
+    D --> J["→ S22"]
+    E --> K["→ S23"]
+    F --> L["→ S19 with payee prefilled"]
+    G --> M["→ S21 status"]
+    H --> N["→ S24"]
+
+    style G fill:#9A6100,color:#fff
+```
+
+**Achieve:** Repeat payments are the common case, so recent payees short-circuit straight to the amount screen. Pending transfers surface here rather than being buried in history — a user who just sent money wants to see it, and it is the entry point to reconciliation if something is stuck.
+
+If the card is **blocked**, outbound actions are disabled with the reason stated. A frozen card that still lets you send money makes the freeze meaningless.
+
+**Status:** Specified, not built
+
+---
+
+## S18 · Send — choose payee
+
+**Goal:** Get to the right recipient without letting the user pay the wrong one.
+
+```mermaid
+flowchart TD
+    A["Payee list"] --> B{Existing payee?}
+    B -->|Yes| C["Select"] --> D["→ S19"]
+    B -->|No| E["Add new payee"]
+    E --> F["Enter details<br/>name · account · kind"]
+    F --> G{Validation}
+    G -->|invalid| H["Field errors"] --> F
+    G -->|valid| I["Confirm identifier<br/>re-entry or checksum"]
+    I --> J["POST /app/payees"]
+    J -->|success| D
+    J -->|failure| K["Retryable error"] --> F
+    A -->|empty| L["'No payees yet'<br/>+ Add first payee"]
+
+    style I fill:#9A6100,color:#fff
+```
+
+**Achieve:** The confirm-identifier step is deliberate friction. Mistyped account numbers are the most common cause of irrecoverable misdirected payments, and a checksum or re-entry catches them before money moves rather than after.
+
+Payee lists show **masked** identifiers. There is no reason to render a full account number in a list.
+
+**Status:** Specified, not built
+
+---
+
+## S19 · Send — amount and note
+
+**Goal:** Compose the transfer, with the constraints visible before submission rather than as a rejection after it.
+
+```mermaid
+flowchart TD
+    A["Amount entry"] --> B["Live validation"]
+    B --> C{"> available balance?"}
+    C -->|Yes| D["'Exceeds available balance'<br/>Continue disabled"]
+    C -->|No| E{"> per-transaction<br/>or daily limit?"}
+    E -->|Yes| F["Show the limit<br/>and what remains"]
+    E -->|No| G["POST /transfers/quote"]
+    G --> H["Show fee · FX · total debit"]
+    H --> I["Continue → S20"]
+    G -->|fail| J["Retryable error"]
+
+    style D fill:#C0362C,color:#fff
+    style F fill:#9A6100,color:#fff
+```
+
+**Achieve:** Client-side limit and balance checks exist for **UX only** — the server remains the authority and must re-validate. Their job is to stop the user composing something that will be rejected.
+
+Fees and FX are shown **before** the review screen, not revealed at the last moment. A total debit that differs from the amount entered is the most common source of "I didn't agree to that."
+
+Amount input uses tabular figures and a numeric keypad; the note field is optional and length-capped.
+
+**Status:** Specified, not built
+
+---
+
+## S20 · Send — review and authorize
+
+**The commit point.** Everything before this is reversible; nothing after it is.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant S as S20
+    participant L as AppLockProvider
+    participant API as Backend
+
+    S->>S: generate idempotencyKey (once, on mount)
+    S->>U: payee · amount · fee · total · quote expiry
+    U->>S: Authorize
+    alt Quote expired
+        S->>API: re-quote
+        API-->>S: new TransferQuote
+        S->>U: show changed figures, require re-confirm
+    end
+    S->>L: stepUpWithBiometrics()
+    L-->>S: authorized
+    S->>API: POST /app/transfers (Idempotency-Key)
+    alt Accepted
+        API-->>S: Transfer PENDING
+        S->>U: → S21 result
+    else Rejected
+        API-->>S: reason
+        S->>U: → S19 with reason, amount preserved
+    else Timeout / no response
+        S->>API: GET /app/transfers?idempotencyKey=…
+        Note over S,API: Reconcile — NEVER blind-retry
+        API-->>S: found → real status, or not found → safe to retry
+    end
+```
+
+**Achieve:** Three things make this screen correct:
+
+1. **The idempotency key is generated once, on mount** — not per attempt. Every retry of *this* transfer carries the same key, so a duplicate submission is deduplicated server-side.
+2. **An expired quote forces re-confirmation.** Rates and fees change; silently executing against a stale quote debits an amount the user never saw.
+3. **Timeout triggers reconciliation, never a blind retry.** The client asks the server what happened to that idempotency key. Only a definitive "not found" makes a retry safe.
+
+**Status:** Specified, not built
+
+---
+
+## S21 · Transfer result and status
+
+**Goal:** Tell the user, unambiguously, what happened to their money.
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING: accepted
+    PENDING --> SETTLED: funds delivered
+    PENDING --> RETURNED: rejected downstream
+    PENDING --> FAILED: never left
+    [*] --> UNKNOWN: client lost the outcome
+    UNKNOWN --> PENDING: reconciled — it did go through
+    UNKNOWN --> FAILED: reconciled — it did not
+    SETTLED --> [*]
+    RETURNED --> [*]
+    FAILED --> [*]
+```
+
+**Achieve:** Each status gets distinct, honest copy. In particular:
+
+- **PENDING** must not read as "Sent." It is accepted, not delivered.
+- **UNKNOWN** must never be shown as either success or failure. It says the outcome is being confirmed, offers to check again, and does **not** offer a Send button.
+- **RETURNED** explains the money came back, and when.
+
+From here the user can view the transfer in history or return to the Pay hub.
+
+**Status:** Specified, not built
+
+---
+
+## S22 · Receive
+
+**Goal:** Let the user get paid — share the details someone needs to send them money.
+
+**Achieve:** The account number is treated with the **same discipline as the PAN**: masked by default, revealed on demand behind step-up, screenshot-blocked while revealed, copied with clipboard auto-clear. It is less sensitive than a PAN but it is still an identifier that enables fraud, and the app already has this machinery — reusing it costs nothing.
+
+Provides a copy action, a share action, and a QR encoding the shareable payment details.
+
+**Status:** Specified, not built
+
+---
+
+## S23 · Add money
+
+**Goal:** Fund the account.
+
+```mermaid
+flowchart TD
+    A["Add money"] --> B["GET /topups/methods"]
+    B -->|empty| C["'No funding methods'<br/>+ contact support"]
+    B --> D["Choose method"]
+    D --> E["Amount"]
+    E --> F{"Within method limits?"}
+    F -->|No| G["Show limit"]
+    F -->|Yes| H["Review"]
+    H --> I["Step-up"]
+    I --> J["POST /topups (Idempotency-Key)"]
+    J --> K["→ S21 status"]
+
+    style I fill:#0A2540,color:#fff
+```
+
+**Achieve:** Same idempotency and step-up discipline as sending. Inbound money is less dangerous than outbound, but a double top-up from a linked funding source is still a real debit against the user elsewhere.
+
+**Status:** Specified, not built
+
+---
+
+## S24 · Manage payees
+
+**Goal:** Keep the payee list trustworthy.
+
+**Achieve:** List with masked identifiers, add, and delete. Deletion confirms, because a removed payee means the next payment has to be re-entered by hand — which is exactly when mistyped-account errors happen.
+
+Editing an existing payee's identifier is **not** supported. It is delete-and-re-add, so the confirm-identifier step in S18 always runs against a new destination. Silently editing where money goes is a fraud vector.
+
+**Status:** Specified, not built
+
+---
+
+# Part IV — Transactions (S11–S12)
+
+Transfers and top-ups appear in this history alongside card transactions, distinguished by direction and type.
 
 ## S11 · Transactions list
 
@@ -507,7 +848,7 @@ Amounts use tabular figures so digits do not shift while scrolling. Credits rend
 
 ---
 
-# Part IV — Profile and settings (S13–S15)
+# Part V — Profile and settings (S13–S15)
 
 ## S13 · Profile
 
@@ -574,7 +915,7 @@ The developer section (force error / empty / offline / slow network) renders onl
 
 ---
 
-# Part V — Cross-cutting behaviour (S16)
+# Part VI — Cross-cutting behaviour (S16)
 
 These are not screens. They are behaviours every screen inherits.
 
@@ -621,7 +962,7 @@ Read-only cached card summary with a visible "offline · last updated" indicator
 
 ---
 
-# Part VI — Design system
+# Part VII — Design system
 
 Palette extracted from the live DOM at `tpcg.global`, then contrast-corrected where it failed WCAG AA.
 
@@ -651,7 +992,7 @@ All 36 foreground/background pairs verified against WCAG AA in both themes.
 
 ---
 
-# Part VII — Build status
+# Part VIII — Build status
 
 | Phase | Scope | Status |
 |---|---|---|
@@ -663,12 +1004,16 @@ All 36 foreground/background pairs verified against WCAG AA in both themes.
 | 6 | S11–S12 transactions | **Done** |
 | 7 | S13–S15 profile | Stubs |
 | 8 | S16 states, a11y, simulator verification | States done; verification pending |
+| 9 | Money-movement service layer — types, 9 `Api` methods, mock, idempotency | **Not started** |
+| 10 | S17–S24 money-movement screens | **Not started** |
 
 **Verification blocker:** no iOS simulator runtime is installed on the build machine. `xcodebuild -downloadPlatform iOS` is required before the app can be run and screenshotted.
 
+**Sequencing note:** phases 9 and 10 can be built against the mock immediately — the `Api` seam means they do not wait on the real endpoints. They should not *ship* ahead of the prerequisites in Part X.
+
 ---
 
-# Part VIII — Known gaps
+# Part IX — Known gaps
 
 | Gap | Impact | Recommendation |
 |---|---|---|
@@ -677,66 +1022,40 @@ All 36 foreground/background pairs verified against WCAG AA in both themes.
 | **App-switcher snapshot on iOS** | No Expo API. Approximated with an `AppState` cover view. | Small native module during security hardening. |
 | **Certificate pinning** | Not implemented — belongs with real API integration. | Add when `http.ts` is wired. |
 | **Analytics** | Call sites marked `TODO(analytics)`; no SDK added. | Wire after integration, scrubbing per §9.5. |
-| **No money movement** | The app cannot send, receive, or transfer funds. See Part IX. | Deferred to v1.1 pending the questions below. |
+| **Money-movement endpoints do not exist** | Part III is fully specified but none of its 9 endpoints is implemented. UI can be built against the mock; it cannot function against the real backend. | Backend work per Part X. |
+| **Step-up strength for transfers** | Transfers inherit the same step-up mechanism as PAN reveal, which currently replays a stored password. Authorizing a payment this way is a worse trade than authorizing a card view. | Fix the step-up token issue (first row) **before** money movement ships, not after. |
 
 ---
 
-# Part IX — Deferred to v1.1: money movement
+# Part X — Prerequisites for money movement
 
-**Status: out of MVP scope, deliberately.** Raised during design review 2026-07-29 and deferred.
+Part III specifies the money-movement product. This part lists what has to be true outside the app before it can function. **The front end can be built against the mock without any of these** — but it cannot ship without them.
 
-## Why it is absent today
+## Scope change, recorded
 
-Money movement appears nowhere in the PRD dated 2026-07-13 — not in the in-scope list (§3), not in the deferred list, and not in the traceability table (§13). The API surface is thirteen methods, all read-only except `blockCard` / `unblockCard`:
+The PRD dated 2026-07-13 covers viewing and freezing only. Money movement appears nowhere in it — not in the in-scope list (§3), not in the deferred list, not in the traceability table (§13). Part III is a **deliberate extension** of that scope, agreed 2026-07-29. The PRD should be updated to match, or this document treated as superseding it for this feature.
 
-```
-acceptInvite · login · refresh · stepUp · changePassword · getMe
-getCards · getCard · getBalance · getSensitive · blockCard · unblockCard
-getTransactions
-```
+## Open items, in dependency order
 
-This follows from the product model. The card is funded and administered on the **Pismo** side; this app is a **viewer and control surface** over a card someone else issued. The PRD's target user is "an individual who has already been issued a virtual card." Adding transfers changes what the product *is*, not just what its home screen shows.
+| # | Item | Owner | Blocks |
+|---|---|---|---|
+| 1 | **Does the Pismo account type expose transfer capability?** If not, everything else is moot. | Backend / Pismo | Everything in Part III |
+| 2 | **Regulatory posture.** Funds transfer is a money-transmission activity in a different compliance category from card viewing — licensing, KYC obligations, and transaction monitoring all change. | Legal / Compliance | Shipping, not building |
+| 3 | **The nine endpoints** in Part III, including server-side idempotency keyed on the client's `Idempotency-Key` header. | Backend | Real-data integration |
+| 4 | **Settlement notification** — webhook or polling — so PENDING transfers resolve without the user re-opening the app. | Backend | S21 status accuracy |
+| 5 | **Payee model.** Internal-only or external rails; where payees are stored; identifier validation and checksum rules. | Product / Backend | S18, S24 |
+| 6 | **Limits and fees.** Per-transaction, daily, monthly caps. FX handling if cross-currency. | Product | S19 |
+| 7 | **Step-up hardening.** Transfers need authorization at least as strong as PAN reveal, which today replays a stored password. Resolve the Part IX first row **before** transfers ship. | Backend | S20 |
 
-Several reference mockups in `examples/` (bankly, Moneyfitch) show prominent Send / Receive / Add actions. Those are generic consumer-wallet designs and were not the basis for this scope.
+## What "cannot ship without" means concretely
 
-## What adding it would actually require
-
-This is a product surface comparable in size to everything built so far — not a button.
-
-```mermaid
-flowchart TD
-    A["Send money"] --> B["Select or add payee"]
-    B --> C["Amount + currency"]
-    C --> D{"Within limits?<br/>Sufficient balance?"}
-    D -->|No| E["Blocked with reason"]
-    D -->|Yes| F["Review + fees + FX"]
-    F --> G["Step-up authentication"]
-    G --> H["Submit transfer"]
-    H --> I{Result}
-    I -->|Accepted| J["Pending state<br/>+ tracking"]
-    I -->|Rejected| K["Reason + remediation"]
-    I -->|"Timeout / unknown"| L["Reconciliation<br/>must not double-send"]
-    J --> M["Settled / returned / reversed"]
-
-    style L fill:#C0362C,color:#fff
-    style G fill:#0A2540,color:#fff
-```
-
-**Blocking questions, in the order they need answering:**
-
-1. **Does the Pismo account type even expose transfer capability?** If not, everything below is moot. This is the first question to ask.
-2. **Regulatory posture.** Funds transfer is a money-transmission activity and sits in a different compliance category from card viewing. Licensing, KYC obligations, and transaction monitoring all change. This is a legal question before it is an engineering one.
-3. **Backend contract.** New endpoints (payees, quote, execute, status), idempotency keys so a retried request cannot double-send, and a webhook or polling path for asynchronous settlement.
-4. **Payee model.** Internal-only, or external rails? Saved payees, and where they are stored.
-5. **Limits and fees.** Per-transaction, daily, monthly. FX handling if cross-currency.
-6. **Failure semantics.** The unknown-outcome case in the diagram above is the hard one: a request that times out after the server accepted it must never be retried blindly.
-7. **Step-up.** Transfers need authorization at least as strong as PAN reveal — which inherits the limitation in Part VIII's first row and should be resolved first.
+Items 1 and 2 are gates — if either fails, Part III does not ship in any form. Items 3–7 are contracts: the UI is written against assumptions in Part III, and each real answer that differs will change specific screens. The `Api` seam limits that blast radius to the service layer plus the affected screen, not the whole app.
 
 ## Front-end readiness
 
-The current architecture does not obstruct this. Screens compose against the `Api` interface, so transfers would arrive as new methods on that interface plus a new route group — no rework of what exists. The design system already carries the needed pieces: `BottomSheet` for confirmation, `Input` with validation, `Countdown` for step-up, `success`/`danger` tokens for result states.
+The architecture does not obstruct any of this. Screens compose against the `Api` interface, so the nine new methods slot in beside the existing thirteen, and `(pay)` is a new route group rather than a change to existing ones. The design system already carries what these screens need: `BottomSheet` for confirmation, `Input` with validation, `Countdown` for quote expiry, `success`/`danger`/`warning` tokens for the transfer states.
 
-**Recommended sequencing:** answer question 1, then 2. If both clear, this becomes its own spec → plan → build cycle rather than an addition to the MVP.
+**Recommended sequencing:** get an answer to item 1 immediately, since it is a single question that determines whether the rest matters. Build phases 9 and 10 against the mock in parallel with items 3–7 being settled.
 
 ---
 
