@@ -90,7 +90,36 @@ The picker is the whole design. Everything after it is the same three screens, r
 ### Account
 The foundational object for all financial operations. Transactions, fees, payments and statements attach to it; the ledger is based on it. An account has **balances and credit limits** as attributes, and contains the cards issued for it.
 
-Each account lives inside a **Program**, and the program's type determines the account's type — credit, debit, or prepaid. This matters: the app's UI for a prepaid account and a credit account are not the same screen (a credit account has a due date, a statement cycle, and delinquency buckets; a prepaid one has a balance).
+Each account lives inside a **Program**, and the program's type determines the account's type — credit, debit, or prepaid.
+
+**Credit is in scope** (decided 2026-08-17), alongside prepaid and debit. That makes program type a **second axis, independent of role**:
+
+> **Role decides what you can see and do. Program type decides what the numbers mean.**
+
+They compose. A cardholder on a prepaid account and a cardholder on a credit account get the same *permissions* and different *screens*. Every balance-bearing screen has to read the program type and render accordingly — this is not one conditional in one place.
+
+| | Prepaid / debit | Credit |
+|---|---|---|
+| Headline number | Balance available | **Available credit** + **balance owed** |
+| Cycle | None | Statement cycle with a closing date |
+| Obligation | None | **Amount due** by a **due date**, and a minimum payment |
+| Cost of carrying | None | **Interest accruals** |
+| Falling behind | Not possible | **Delinquency buckets**, and cards blocked as a consequence |
+| Statements | A period of activity | A closed cycle with a due date and a balance |
+
+### ⚠ Credit creates an obligation this app cannot discharge
+
+A credit account has a bill. The gateway exposes the bill — current statement, amount due, due date, interest accruals, delinquency buckets — and the app will show it.
+
+**But payment initiation is out of scope.** So the app can display *"HK$12,400 due in 5 days"* and offer no way to pay it. That is a support-call generator and, if the due date passes, a delinquency the user watched approach and could not act on.
+
+Three ways out, in order of preference:
+
+1. **Tell them where to pay.** The due panel carries an explicit "settled by bank transfer / direct debit / your finance team" line, per deployment. Cheap, honest, ships now.
+2. **Bring statement payment into scope** as the *one* money-movement feature. Pismo supports it; it is a narrow, single-payee, single-purpose flow — much smaller than the deferred Part III.
+3. **Ship credit without the due panel.** Worst option: the information exists and hiding it does not make the obligation go away.
+
+**This needs a decision before credit ships.** Option 1 is the default assumed throughout these documents.
 
 **Account statuses:** `NORMAL` (default at creation), `BLOCKED`, `CANCELLED`, `CLOSED`. Transaction-banking accounts add dormancy statuses. Custom statuses can be defined per org. ⚠
 
@@ -115,9 +144,13 @@ Two statements appear in Pismo's own account documentation:
 **Consequence for us:** the app's login identity is **not** a Pismo customer id. It is our own `User`, which resolves to a *set* of `(customer_id, account_id)` pairs. This is the single most important design fact in this document.
 
 ### Account hierarchies
-A parent/child relationship can be defined between accounts. Pismo's **Get related accounts** endpoint returns balances and limits for all related accounts under a parent, up to two levels of children, within the same Org.
+Accounts link through the account object's **`parent_account_id`** field, settable at creation or on update. A parent can have many children; a child has one parent and can have children of its own. Child accounts inherit the parent's configuration (timezone, program binding) unless overridden.
 
 **This is how "Apple, the company" is represented.** Apple is the parent account; "Drivers team", "Sales team", "Contractors" are child accounts. The org administrator's view is a walk of that hierarchy — not a bespoke query we invent.
+
+**Depth is unlimited; the convenience endpoint is not.** `parent_account_id` imposes no depth limit, so a hierarchy can be as deep as a corporation needs. But **Get related accounts** — the one call that returns balances and limits for a whole tree — covers only parent + children + grandchildren, and returns them as a **flat array with the parent/child links stripped**. So even within three levels we cannot render a tree from it.
+
+**Consequence:** the backend maintains its own account-tree index, built from `parent_account_id` and kept current by webhooks. *Get related accounts* becomes a balance source, not the navigation primitive. Arbitrary depth is achievable; it is just not free.
 
 ### Card
 Belongs to an account, issued to a customer on that account. `VIRTUAL` or `PHYSICAL`. Mode `SINGLE` or `MULTIPLE`. Carries a transaction limit, a printed name, an expiry, and (for virtual) a rotating CVV.
@@ -132,27 +165,31 @@ Belongs to an account, issued to a customer on that account. `VIRTUAL` or `PHYSI
 
 Five types. The first three are app users; the fourth is a console user; the fifth is optional but cheap.
 
-### U1 · Cardholder
+> **Naming, settled 2026-08-17.** These use Pismo's own terms in [Screens-and-flows.md](Screens-and-flows.md): **U1 = AC**, additional customer · **U2 = PC**, primary customer · **U3 = OA**, organization admin (a PC whose account is a parent account) · **U5 = AU**, auditor. The U-codes are kept here because the feature tables below reference them.
+
+### U1 · Cardholder — *additional customer (AC)*
 **Who:** Chan Taiman, the driver.
 **Identity:** one `person`, one or a few `customer` records, each on one account.
 **Sees:** only the cards issued **to him**, on the accounts he is a customer of. Balance of those cards. Transactions on those cards.
 **Can:** view masked card, reveal PAN/CVV under step-up, freeze/unfreeze **his own** card, view his transactions and statements, change his own password.
 **Cannot:** see other people's cards on the same account, issue cards, add or remove customers, see account-level totals.
 
-> The nuance that makes this hard: Chan Taiman is a customer on a **shared-balance** account. He can see *his card's* activity, but he should not necessarily see the account's whole ledger — because that includes other drivers' spending. **This is a policy decision we have not made.** See Open Question 3.
+> **Settled:** Chan Taiman is a customer on a **shared-balance** account. He sees three things — his own transactions, what he has spent, and the balance still available on the shared pool. He never sees another driver's activity or who consumed the rest of the pool. Detail in Screens-and-flows §2.
 
-### U2 · Account manager
+### U2 · Account manager — *primary customer (PC)*
 **Who:** the drivers-team supervisor.
-**Identity:** a customer on one account, flagged in **our** system as manager of it. Pismo has no "manager" concept — it has an owner, and that is not the same thing.
-**Sees:** every card on that one account, every customer on it, the account balance and limit, the full transaction ledger and statements for the account.
-**Can:** everything U1 can, plus — issue a new card on the account, freeze/unfreeze/cancel **any** card on it, set per-card transaction limits, invite a person as a customer of the account, remove a customer.
-**Cannot:** touch sibling accounts, create accounts, change program configuration.
+**Identity:** a customer on one account who **also holds our manager role** for it. Several people can be PC of the same account.
 
-### U3 · Organization administrator
+> **PC is not Pismo's account owner.** Pismo permits exactly one owner per account, and for a corporate account that owner should be **the company** — `Apple Inc.`, a `company` object, not a human. Our PC role is a row in our own authorization table, `(user, account, role)`, and any number of people can hold it. Keeping these separate is what lets a manager appoint a deputy without surrendering their own rights, and it means no Pismo object changes when a manager is appointed.
+**Sees:** every card on that one account, every customer on it, the account balance and limit, the full transaction ledger and statements for the account.
+**Can:** everything U1 can, plus — issue a new card on the account, freeze/unfreeze/cancel **any** card on it, set per-card transaction limits, invite a person as a customer, remove a customer, and **promote another customer to PC** without escalating to the OA.
+**Cannot:** touch sibling accounts, create accounts, change program configuration, override an org-wide policy set by the OA.
+
+### U3 · Organization administrator — *org admin (OA)*
 **Who:** Mr. Zhang.
-**Identity:** bound to the **parent account** / org, not to a single child account.
+**Identity:** a PC whose account is a **parent account**. Same rights as U2, applied down the tree — not a separate permission tier.
 **Sees:** the whole account hierarchy under the company — every child account, every card, every customer, consolidated balances and limits.
-**Can:** everything U2 can, on **every** account in the hierarchy, plus — open a new child account (submit an account application), promote/demote account managers, view consolidated reporting.
+**Can:** everything U2 can, on **every** account in the hierarchy, plus — open a new child account (submit an account application), promote/demote managers anywhere in the tree, view consolidated reporting, and **set org-wide policy** that every child account inherits and no PC can override.
 **Cannot:** change program definitions, exchange rates, or anything at issuer level.
 
 ### U4 · Issuer / back-office operator
@@ -345,7 +382,8 @@ Legend for **Backend**: 🟢 endpoint exists on the gateway today · 🟡 exists
 | F19 | View customer detail | U2 U3 U5 | 🔴 |
 | F20 | Invite a person as customer of an account | U2 U3 | 🔴 |
 | F21 | Remove a customer from an account | U2 U3 | 🔴 |
-| F22 | Assign / revoke account-manager role | U3 | 🔴 (our own role table) |
+| F22 | Promote a customer to PC / demote them | **U2** U3 | 🔴 (our own role table) |
+| F52 | Cancel a departed person's cards on removal, retain their history | U2 U3 | 🟡 card status + retention policy |
 
 ### D · Cards
 
@@ -364,6 +402,11 @@ Legend for **Backend**: 🟢 endpoint exists on the gateway today · 🟡 exists
 | F33 | Reissue / replace a lost card | U2 U3 | 🟡 Pismo card reissuing |
 | F34 | Set / change PIN | U1 | 🟡 — `pin_length` accepted at issue, no PIN management |
 | F35 | Add to Apple Pay / Google Pay | U1 | 🟡 Pismo tokenization |
+| F49 | Order a physical card (address, embossed name, courier) | U2 U3 | 🔴 |
+| F50 | Track card production & delivery status | U1 U2 U3 | 🔴 — may not exist; depends on the card bureau |
+| F51 | Flag cards expiring within 60 days | U2 U3 | 🟢 derived from card expiry |
+
+**Physical cards are in scope** (decided 2026-08-17). Issuance works today — `CreateCardDto` accepts `type: PHYSICAL` and `pin_length`. Everything *after* issuance does not: activation, PIN management, reissuing and delivery tracking are all unexposed. F32, F33, F34, F49 and F50 are the least backed features in this document.
 
 **F27, F28, F29 are the named gaps.** F28/F29 are the "block card and so on" the brief calls out — Pismo has the endpoint, our gateway does not proxy it. F27 is worse: it is the app's headline feature and there is no path to it at all today.
 
@@ -377,6 +420,12 @@ Legend for **Backend**: 🟢 endpoint exists on the gateway today · 🟡 exists
 | F39 | List statements for an account | U1(own) U2 U3 U5 | 🟢 `GET /statements/accounts/{accountId}` |
 | F40 | Current open statement | same | 🟢 `.../current` |
 | F41 | Interest accruals (credit programs) | U2 U3 U5 | 🟢 `.../interest-accruals` |
+| F56 | Credit headline: available credit, balance owed, amount due, due date | U1(own) U2 U3 U5 | 🟢 account + current statement |
+| F57 | Statement cycle position — days remaining, closing date | U1 U2 U3 | 🟢 `/programs/{id}/due-dates`, `/programs/calendars` |
+| F58 | Minimum payment due | U1(own) U2 U3 | 🟢 current statement |
+| F59 | "How to pay" panel — per-deployment settlement instructions | U1 U2 U3 | 🔴 config, no API |
+| F60 | Delinquency state surfaced on the card and account | U1(own) U2 U3 U5 | 🟢 delinquency buckets |
+| F61 | Program-type-aware rendering on every balance screen | all | 🟢 program type on the account |
 | F42 | Delinquency buckets / arrears | U2 U3 U5 | 🟢 `GET /delinquency/accounts/{accountId}/buckets` |
 | F43 | Statement as a shareable PDF | U1 U2 U3 | 🔴 — Pismo supplies data, **rendering is ours** |
 | F44 | Programs: due dates, calendars | U2 U3 | 🟢 `GET /programs/{programId}/due-dates`, `GET /programs/calendars` |
@@ -390,6 +439,9 @@ F38 is a small but real gap: a cardholder on a shared-balance account filtered o
 | F45 | Loading / empty / error / offline states everywhere | all | — |
 | F46 | Push notification on card status change or transaction | all | 🔴 — webhooks exist for VCAS 3DS only |
 | F47 | Audit log of who froze / cancelled / issued what | U3 U5 | 🔴 |
+| F53 | **Org-wide policy: managers may see cardholders' transaction detail** — on by default, OA can switch off | U3 sets, all affected | 🔴 |
+| F54 | Redacted transaction detail when F53 is off — merchant name and location absent from the response | U2 U3 | 🔴 — **must be server-side** |
+| F55 | Retention / anonymisation period for a departed person's history | — | 🔴 policy, backend-enforced |
 | F48 | 3DS step-up during a purchase (VCAS) | U1 | 🟢 `POST /webhooks/vcas` — **inbound to us**; the in-app half is 🔴 |
 
 F48 is worth flagging: the gateway already receives Visa 3DS step-up webhooks. Something has to present that challenge to the cardholder, and this app is the natural place. It is not payment *processing* — it is authenticating a payment someone else is processing — so it stays in scope, but it is unbuilt on the app side.
@@ -415,13 +467,26 @@ In dependency order. Nothing below the first item matters until the first item i
 | 7 | Statement PDF rendering — composition, storage, link expiry, retention. | F43 |
 | 8 | Card-event webhooks → push. | F46, F47 |
 
-### Product decisions still open
+### Product decisions — settled 2026-08-17
 
-1. **Does an account manager exist as a distinct role, or is U2 just U3 scoped to one account?** Collapsing them is simpler and probably right; splitting them is more accurate to how a company delegates. Affects the role table, not the screens.
-2. **Is the org administrator bound to the parent *account*, or to a company entity above accounts?** Pismo's hierarchy suggests the former. If Apple has account trees that are not connected to each other, the former breaks.
-3. **On a shared-balance account, does a cardholder see the whole account ledger or only their own card's activity?** Only-own is the safe default and the one to ship. Whole-ledger is what a "shared account" arguably means. Blocks F36/F38.
-4. **Which program types are we launching on?** Credit implies statements, due dates, delinquency and interest — a materially larger app than prepaid. The gateway exposes all four surfaces, which suggests credit, but that has not been stated.
-5. **Physical cards, yes or no?** F32/F33/F34 exist only if yes. `CreateCardDto` accepts `PHYSICAL`, so the backend assumes yes.
+| Question | Decision |
+|---|---|
+| Is the account manager a distinct role from the org admin? | **No.** OA is a PC whose account is a parent account. One tier, two scopes. |
+| Is the org admin bound to the parent account or to a company above accounts? | **The parent account.** |
+| On a shared-balance account, what does a cardholder see? | **Own card only** — own transactions, own spend, and the pool's available balance. |
+| Can a manager see a cardholder's transaction detail? | **Yes by default, switchable off org-wide** by the OA (F53/F54). |
+| How deep can the hierarchy go? | **Any depth.** We keep our own tree index; *Get related accounts* is a balance source. |
+| Does removing a person cancel their cards? | **Yes, irreversibly.** History retained (F52), retention period TBD (F55). |
+| Who can promote to PC? | **Any PC of that account.** Promotion is additive — nobody loses a card or a right. |
+| Physical cards? | **In scope.** F32–F34, F49–F51. |
+| Which program types? | **Credit as well as prepaid/debit.** Statements, cycles, due dates, interest accruals and delinquency are all in scope. |
+
+### Still open
+
+1. **Retention / anonymisation period** for a departed person's history (F55). Legal, not product.
+3. **Does org-wide policy also cover reveal?** Whether an organization can switch off PAN reveal entirely for its cardholders.
+4. **Delivery-tracking depth** for physical cards (F50) — depends on what the card bureau exposes, which is not in the gateway at all.
+5. **Can a PC promote someone in a child account they do not manage?** Assumed no — only within their own account, or anywhere in the tree if they are an OA.
 
 ---
 
