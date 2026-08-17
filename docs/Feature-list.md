@@ -5,9 +5,81 @@
 
 ---
 
-## Part 0 — The one-paragraph version
+## Part 0 — The application, in one page
+
+### The one-paragraph version
 
 One app, one login. Who you are decides what you see. A driver sees the one card he was given and can freeze it. His team's manager sees every card on that team's account and can issue, freeze and cancel them. The company's administrator sees every account and every card under the company. Same screens, different scope — the scope comes from the token, never from a parameter the app sends.
+
+### The flow, in four steps
+
+1. **Sign in.** One set of credentials. Not a card login, not an account login — a *person* login.
+2. **Choose your context.** The app shows every place you have access, as one row each: *which organization · which department · what you are there*. Pick one.
+3. **Manage.** The screens are the same for everyone. What is on them, and which buttons are live, comes entirely from the context you picked.
+4. **Switch.** Change context at any time without signing out.
+
+### The idea that makes this work: one login, many hats
+
+**Access belongs to the context, not to the person.**
+
+The same human can appear twice in the same company, at two completely different access levels, and both are correct:
+
+> **Lee Wing** works at Apple. They hold a card on the **Managers team** account — that is their own spending card. They also run the **Contractors** sub-account, where a dozen contractor cards are issued.
+>
+> - Picking **Apple · Managers team** → they are a **cardholder**. One card, theirs. They can look at it, reveal it, freeze it, and read its transactions. They cannot see the other managers' cards or the team's total spend.
+> - Picking **Apple · Contractors** → they are a **manager**. Every card on that sub-account, every contractor on it, the whole ledger. They can issue, freeze, cancel, and set limits.
+>
+> Same person, same password, same app. The second context is far more powerful than the first — and switching to it does not leak anything backwards into the first.
+
+Two rules keep this honest:
+
+- **You never hold two hats at once.** One context is active at a time. There is no merged super-view where the manager's power quietly applies to their personal card.
+- **Reveal never travels with rank.** Lee Wing can freeze any contractor's card as a manager, but they can only reveal the full number of a card issued to *them*. Managing a card and reading its secrets are different rights.
+
+Contexts can also span organizations entirely — a contractor working for two companies sees both, side by side, in one list.
+
+### Overview diagram
+
+```mermaid
+flowchart TD
+    Login(["Sign in<br/>one person, one password"]) --> Resolve{"How many<br/>contexts?"}
+
+    Resolve -->|"exactly one"| Straight["Skip the picker"]
+    Resolve -->|"more than one"| Picker
+
+    Picker["<b>Choose your context</b><br/>organization · department · your role"]
+
+    Picker --> C1["Apple · Managers team<br/>you are a <b>Cardholder</b>"]
+    Picker --> C2["Apple · Contractors<br/>you are a <b>Manager</b>"]
+    Picker --> C3["Acme Ltd · Operations<br/>you are a <b>Cardholder</b>"]
+    Picker --> C4["Apple · whole company<br/>you are an <b>Administrator</b>"]
+
+    C1 --> Own
+    C3 --> Own
+    Straight --> Own
+    C2 --> Team
+    C4 --> Org
+
+    Own["<b>My card</b><br/>view · reveal number · freeze<br/>my transactions only"]
+    Team["<b>This department</b><br/>every card · every person<br/>issue · freeze · cancel · set limits<br/>full department ledger"]
+    Org["<b>Whole organization</b><br/>every department · consolidated view<br/>open accounts · appoint managers"]
+
+    Org -.->|"drill into a department"| Team
+    Team -.->|"open one card"| Own
+
+    Own -.->|"switch context"| Picker
+    Team -.->|"switch context"| Picker
+    Org -.->|"switch context"| Picker
+
+    style Picker fill:#0A2540,color:#fff
+    style Own fill:#F6F9FC
+    style Team fill:#F6F9FC
+    style Org fill:#F6F9FC
+```
+
+The picker is the whole design. Everything after it is the same three screens, rendered at whatever scope the chosen context allows.
+
+> **Where this sits technically:** the context list is the output of the *Resolve identity* step in [Part 3](#part-3--refined-flow). Each row is one `(organization, account, role)` triple. Picking a row is what produces the scoped token every later screen reads from.
 
 ---
 
