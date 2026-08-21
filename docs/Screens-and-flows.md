@@ -1,580 +1,512 @@
 # Screens & Flows
 
 **Status:** working draft · **Date:** 2026-08-13
-**Companion to:** [Feature-list.md](Feature-list.md) — read Part 0 there first for the one-page overview.
+**Revised:** 2026-08-19 — reshaped around the verified Pismo object model. Adds partner-issued card programs as a first-class use case.
+**Companion to:** [Feature-list.md](Feature-list.md)
 
-Every screen in the app, and every path a user can take through them. Flows are written as plain screen-to-screen paths. Diagrams are small and per-section, never one big one.
+Every screen in the app, and every path through them. Flows are written as plain screen-to-screen paths. Diagrams are small and per-section.
 
----
-
-## The roles
-
-| Code | Role | What it is |
-|---|---|---|
-| **AC** | Additional customer | A `customer` on an account, holding a card. Sees their own card and their own spending. |
-| **PC** | Primary customer | A customer on an account who **also holds our manager role** for it. Full control of that one account. Several people can be PC of the same account. |
-| **OA** | Organization admin | **A PC whose account is a *parent* account.** Same rights, applied down the tree. Not a separate permission tier. |
-| **AU** | Auditor | A read-only overlay on PC or OA scope. Optional, ship later. |
-
-### PC is our role, not Pismo's account owner
-
-These are two different things and conflating them breaks the model:
-
-| | Pismo **account owner** | Our **PC** role |
-|---|---|---|
-| How many per account | Exactly one | As many as needed |
-| What it is | The `person`/`company` the account was created with | A row in **our** authorization table: `(user, account, role)` |
-| Who it should be | For a corporate account, **the company** — `Apple Inc.`, not a human | A human who manages the account day to day |
-| Changes when | Almost never. Legal/administrative fact | Whenever someone is promoted or demoted |
-
-So on the *Apple · Contractors* account, the Pismo owner is **Apple Inc.** (a `company` object) and the PCs are whichever humans manage contractors this quarter. Nothing in Pismo has to change when a manager is appointed.
-
-Throughout this document: **AC** = own card only, **PC** = full control of one account, **OA** = full control of a tree.
+One app serves four kinds of user. **Everyone gets the same build; the tabs and actions they see come from their role.** Nothing is greyed out — it is absent.
 
 ---
 
-## Screen inventory
+## 1 · The model
 
-### Entry & identity
+Read directly from Pismo's *Core objects* and *Program types* references on 2026-08-19. Quoted text is verbatim.
+
+```mermaid
+flowchart TD
+    O["<b>Organization</b> · the Tenant<br/>YedPay — the root object"]
+    O --> PG1["<b>Program</b> · our own<br/>type · currency · brand"]
+    O --> PG2["<b>Program</b> · a partner's<br/>co-branded"]
+    PG1 --> A1["Account"]
+    PG2 --> A2["Account"]
+    PG2 --> A3["Account"]
+    A1 --> CU["<b>Customer</b><br/>one account only"]
+    CU --> K["<b>Card</b><br/>issued to a customer"]
+    CU -.->|"maps to"| E["<b>Entity</b><br/>the legal person/company<br/><i>the real identity</i>"]
+
+    style O fill:#0A2540,color:#fff
+    style E fill:#0A2540,color:#fff
+    style PG2 fill:#F6F9FC
+```
+
+| Object | What it is | Why it matters here |
+|---|---|---|
+| **Organization** | *"Defines your company or enterprise. Contains one or more programs."* The root. Its ID is the Tenant ID, `TN-…`. | **This is YedPay.** Not the partner, not the customer company. |
+| **Program** | *"Defines a set of parameters for a group of accounts."* Carries type, currency, brand, due dates. Accounts inherit anything they do not define. | **This is the partner boundary.** A partner is one or more programs inside our org. |
+| **Entity** | *"A legal entity (person, company, or organization)."* And crucially: *"multiple customers with different customer IDs could all map to the same entity object, meaning they are all the same person or company."* | **This is identity.** One human = one entity = many customer records. |
+| **Account** | *"Each account belongs to a single program."* One owner, one balance. | The ledger. |
+| **Customer** | *"Each account contains at least one customer… but only one designated owner. **A customer can only belong to one account.**"* | The link between an entity and one account. |
+| **Card** | Issued to a customer. | Never to an account directly. |
+
+### Program types
+
+`CREDITO` · `CREDITO ZERO-BALANCE` · `DEBITO` · `DEBITO ZERO-BALANCE` · `PRE-PAGO` · `PRE-PAGO ZERO-BALANCE` · `VOUCHER`
+
+Full-balance vs zero-balance is a card-network integration model, not a product difference the cardholder sees. **The app cares about three:** credit, debit, prepaid. Voucher (meal/food) is a prepaid variant worth knowing exists — a partner may well want one.
+
+### What this settles
+
+**Entity is the answer to "what does a login map to."** Our `User` maps to one Pismo **entity**; that entity has one customer record per account they hold. The old contradiction — "a customer can have multiple accounts" vs *Core objects*' flat *"a customer can only belong to one account"* — dissolves: the customer is the link, the entity is the person.
+
+> ⚠ **Do not build on entity lookup.** Pismo: *"To search an organization's data using an entity ID, contact our Service Desk and request this."* Entity search is off by default. Our BFF keeps its own `user → [(customer_id, account_id)]` table; entity is the concept we mirror, not an API we call.
+
+---
+
+## 2 · Three account shapes
+
+The same objects arrange three ways. Everything downstream follows from which one you are in.
+
+```mermaid
+flowchart LR
+    subgraph S1["① Personal"]
+        direction TB
+        P1O["owner: a person"] --> P1C["1 customer<br/>their own cards"]
+    end
+    subgraph S2["② Company"]
+        direction TB
+        P2O["owner: the company"] --> P2C["many customers<br/>employees, shared pool"]
+    end
+    subgraph S3["③ Partner-issued"]
+        direction TB
+        P3O["① or ② …<br/>inside a partner's program"] --> P3C["partner oversees<br/>many accounts"]
+    end
+```
+
+| | ① Personal | ② Company | ③ Partner-issued |
+|---|---|---|---|
+| Owner | a `person` | a `company` | either |
+| Customers | usually just them | employees | per underlying shape |
+| Balance | theirs | **shared pool** | per underlying shape |
+| Whose program | ours | ours | **the partner's** |
+| Who manages | nobody — self-service | a company manager | a partner program manager |
+| Example | a card we issue you directly | Apple's drivers | cards issued under Acme's brand |
+
+**③ is not a third structure — it is ① or ② sitting in a partner's program.** That single fact keeps the app from forking: partner accounts reuse every personal and company screen. What the partner *adds* is an oversight layer above many accounts.
+
+> **The unit of management differs, and that is the whole design.** A company manager manages **customers on one account**. A partner manager manages **accounts in one program**. Different noun, different tab, different screens.
+
+---
+
+## 3 · Who uses this app
+
+| Code | Persona | Scope | Manages |
+|---|---|---|---|
+| **CH** | Cardholder | their own personal account | nothing — self-service |
+| **EC** | Employee cardholder | their card on a company account | nothing |
+| **CM** | Company manager | one company account | **customers** |
+| **PM** | Partner manager | one program | **accounts** |
+| **AU** | Auditor | read-only over CM or PM scope | nothing. Optional, ship later |
+| **BO** | Back-office (us) | everything | not this app — a console |
+
+**CM is our role, not Pismo's account owner.** Pismo permits exactly one owner and setting `is_owner = true` *changes* it, firing an *Account owner changed* event — a second owner is unrepresentable. So the owner is the company; CM is a row in our table, `(user, account, role)`, and several people can hold it.
+
+**PM is likewise ours**, scoped to `program_id` rather than `account_id`.
+
+### Tabs
+
+| Tab | CH | EC | CM | PM |
+|---|:--:|:--:|:--:|:--:|
+| Home | ✅ | ✅ | ✅ | ✅ |
+| Cards | — | — | ✅ | ✅ |
+| People | — | — | ✅ | — |
+| Accounts | — | — | — | ✅ |
+| Transactions | own | own | account | program |
+| Profile | ✅ | ✅ | ✅ | ✅ |
+
+Three tabs for cardholders, five for managers. A cardholder never sees a Cards tab because their card is the Home screen.
+
+### Who may reveal a card number
+
+| | Own card | Someone else's |
+|---|:--:|:--:|
+| CH | ✅ | n/a |
+| EC | ✅ | ❌ |
+| CM | ✅ | ❌ |
+| PM | ✅ *(only if they hold one)* | ❌ **never** |
+| AU | ❌ | ❌ |
+
+**Reveal never travels with rank.** A company manager may freeze, cancel, replace and re-limit an employee's card and still never read its number. A partner manager is stricter still: their end-customers are consumers, not staff.
+
+> ⚠ **The platform will not enforce this.** Pismo's PCI endpoints return a PAN by card id and do not know who is asking. "Own card only" exists **solely in our BFF**. This is the single easiest thing to get wrong and the worst to get wrong.
+
+### Who may read transaction detail
+
+| | Default | Notes |
+|---|---|---|
+| CH / EC | full, own card | always |
+| CM | full, all employees | **switchable off per org** — merchant name and location redacted server-side. Employer oversight of a company budget. |
+| PM | **masked by default** | Account status, balances, card status, aggregate spend. **Not** merchant-level detail on a consumer's spending. |
+
+The CM and PM defaults are deliberately opposite. An employer funds the spending and has a legitimate reason to see it; a partner whose brand is on the card does not automatically acquire the right to read a consumer's purchase history. Flipping PM to full detail is a per-program decision with a compliance conversation attached, not a toggle we ship on.
+
+---
+
+## 4 · Screen inventory
+
+### A · Access & identity
 
 | ID | Screen | Who | Purpose |
 |---|---|---|---|
 | A1 | Splash | all | Silent token refresh, decide where to land |
 | A2 | Sign in | all | Email + password |
-| A3 | Accept invite | new users | Opened from deep link `cardapp://invite` |
+| A3 | Accept invite | new users | Deep link `cardapp://invite` |
 | A4 | Set password | new users | First password, rules, confirmation |
 | A5 | Unlock | all | Biometric or passcode after auto-lock |
 | A6 | Can't sign in | all | Support contact — **no self-serve reset yet** |
-| A7 | Choose context | multi-context users | **One row per account** — organization, account, and your role on it |
-| A8 | Step-up challenge | all | Biometric / password re-auth before sensitive actions |
+| A7 | Choose context | rare | One row per account or program you hold |
+| A8 | Step-up challenge | all | Re-auth before anything sensitive |
 
-### Home
+### H · Home — one screen, four variants
+
+| ID | Variant | Who | Shows |
+|---|---|---|---|
+| H1 | Home | all | The tab; renders one of the variants below. Referred to as `H1` in flow paths |
+| H1-a | Cardholder | CH | My card, my balance, my recent transactions |
+| H1-b | Employee | EC | My card, **what I spent**, **what's left in the pool**, my transactions |
+| H1-c | Company manager | CM | My card if I hold one · account balance and limit · cards · people · account activity |
+| H1-d | Partner manager | PM | Program totals · accounts · active cards · alerts (delinquency, blocked, expiring) |
+
+### C · Card
 
 | ID | Screen | Who | Purpose |
 |---|---|---|---|
-| H1 | Home | all | **One screen, three variants** — see below |
-| H1-a | Home · cardholder variant | AC | My card, **my spend + available balance**, my recent transactions |
-| H1-b | Home · manager variant | PC | **My card (if I hold one)**, account balance, card count, people count, recent account activity |
-| H1-c | Home · org variant | OA | Consolidated balance, department list, cross-department activity |
-
-### Card
-
-| ID | Screen | Who | Purpose |
-|---|---|---|---|
-| C1 | Card list | PC OA AU | Every card on the account — masked PAN, holder, status |
-| C2 | Card detail | all | Masked PAN, expiry, status, limit, holder, actions |
+| C1 | Card list | CM PM AU | Cards in scope — masked PAN, holder, status |
+| C2 | Card detail | all | Masked PAN, expiry, status, limit, holder |
 | C3 | Reveal PAN/CVV | own card only | Full number, 90 s, screenshots blocked |
-| C4 | Freeze / unfreeze sheet | AC(own) PC OA | Reversible. Bottom sheet, not a route |
-| C5 | Cancel card confirm | PC OA | **Irreversible.** Typed confirmation |
-| C6 | Issue card — form | PC OA | Holder, virtual/physical, limit, name, expiry |
-| C7 | Issue card — result | PC OA | Success + jump to the new card, or failure |
-| C8 | Edit card limit | PC OA | Single field, current value shown |
-| C9 | Activate physical card | AC PC | Last 4 + confirm |
-| C10 | Replace card | PC OA | Reissue lost/damaged, cancels the old one |
-| C11 | Set / change PIN | AC | Own card only |
-| C12 | Add to wallet | AC | Apple Pay / Google Pay handoff |
-| C13 | Card delivery status | AC PC OA | Physical only — ordered · embossed · shipped · delivered |
-| C14 | Order physical card | PC OA | Delivery address, embossed name, courier |
+| C4 | Freeze / unfreeze sheet | CH EC(own) CM PM | Reversible. Bottom sheet, not a route |
+| C5 | Cancel card confirm | CM PM | **Irreversible.** Typed confirmation |
+| C6 | Issue card — form | CM PM | Holder, virtual/physical, limit, name, expiry |
+| C7 | Issue card — result | CM PM | Success + jump to the card, or failure |
+| C8 | Edit card limit | CM PM | Single field, current value shown |
+| C9 | Activate physical card | CH EC | Last 4 + confirm |
+| C10 | Replace card | CM PM | Reissue lost/damaged; cancels the old one |
+| C11 | Set / change PIN | CH EC | Own card only |
+| C12 | Add to wallet | CH EC | Apple Pay / Google Pay handoff |
+| C13 | Delivery status | CH EC CM PM | Physical only — ordered · embossed · shipped · delivered |
+| C14 | Order physical card | CM PM | Delivery address, embossed name, courier |
 
-### People
-
-| ID | Screen | Who | Purpose |
-|---|---|---|---|
-| P1 | People list | PC OA AU | Every customer on the account, role, card count |
-| P2 | Person detail | PC OA AU | Their cards, their activity, their role |
-| P3 | Invite person — form | PC OA | Name, email, optional card at the same time |
-| P4 | Pending invites | PC OA | Sent, expiring, resend, revoke |
-| P5 | Remove person confirm | PC OA | What happens to their cards |
-| P6 | Change person's role | OA | Promote to primary / demote |
-
-### Account
+### P · People — customers on a company account
 
 | ID | Screen | Who | Purpose |
 |---|---|---|---|
-| N1 | Account overview | PC OA AU | Balance, limit, status, program type; credit adds cycle and due date |
-| N2 | Departments | OA AU | Child accounts, per-department balance |
-| N3 | Open new account — form | OA | Application: applicant, program, due date |
-| N4 | Application status | OA | Pending / approved / rejected |
-| N5 | Account settings | OA | Status, credit limit, billing cycle day |
-| N6 | Organization policies | OA | Org-wide toggles inherited by every child account |
+| P1 | Employees | CM AU | Everyone on the account — role, cards, limit, label |
+| P2 | Employee detail | CM AU | Their cards, activity, role, spending limit |
+| P3 | Invite employee | CM | Name, email, optional card at the same time |
+| P4 | Pending invites | CM | Sent, expiring, resend, revoke |
+| P5 | Remove employee | CM | **Cancels their cards.** Irreversible |
+| P6 | Change role | CM | Promote to manager / demote |
+| P7 | Spending limit | CM | Flex control — amount, period, reset |
+| P8 | Labels | CM | Group employees; carries a default limit for joiners |
 
-### Transactions & statements
+### K · Portfolio — accounts in a program *(new)*
 
 | ID | Screen | Who | Purpose |
 |---|---|---|---|
-| T1 | Transactions | all, scoped | List, grouped by day, infinite scroll |
-| T2 | Transaction detail | all, scoped | Merchant, amount, FX, status, card used |
-| T3 | Filters | all | Date range, card, person, type, amount |
-| T4 | Statements | AC(own) PC OA AU | Closed cycles + current open cycle |
+| K1 | Accounts | PM AU | Every account in the program — holder, status, balance, cards |
+| K2 | Account summary | PM AU | One account: status, balance, cards, holder. **Masked** |
+| K3 | Onboard account — form | PM | Application: applicant, program, due date |
+| K4 | Application status | PM | Pending / approved / rejected |
+| K5 | Program overview | PM AU | Totals, active cards, delinquency, alerts |
+| K6 | Program settings | PM AU | **Read-only.** Type, currency, brand, limits, due dates |
+
+### N · One account
+
+| ID | Screen | Who | Purpose |
+|---|---|---|---|
+| N1 | Account overview | CM PM AU | Balance, limit, status, program type; credit adds cycle and due date |
+| N4 | Account health | CM PM AU | Status and collection status. **Read-only** |
+
+### T · Transactions & statements
+
+| ID | Screen | Who | Purpose |
+|---|---|---|---|
+| T1 | Transactions | all, scoped | Grouped by day, infinite scroll |
+| T2 | Transaction detail | all, scoped | Merchant, amount, FX, status, card — **redactable** |
+| T3 | Filters | all | Date, card, person, account, label, type, amount |
+| T4 | Statements | CH EC(own) CM PM AU | Closed cycles + current |
 | T5 | Statement detail | same | Summary, download / share PDF |
-| T6 | Interest & arrears | PC OA AU | Credit only — accruals, delinquency buckets |
-| T7 | Amount due | AC(own) PC OA | Credit only — balance owed, minimum, due date, how to pay |
+| T6 | Interest & arrears | CM PM AU | Credit only |
+| T7 | Amount due | CH EC(own) CM PM | Credit only — owed, minimum, due date, how to pay |
 
-### Profile
+### R · Profile
 
 | ID | Screen | Who | Purpose |
 |---|---|---|---|
 | R1 | Profile | all | Name, email, current context |
 | R2 | Change password | all | Old + new + confirm |
 | R3 | Settings | all | Biometrics, notifications, language, about |
-| R4 | My access | all | Every context you hold, read-only list |
-| R5 | Sign out confirm | all | Wipes tokens |
+| R4 | My access | all | Every context held, read-only |
+| R5 | Sign out | all | Wipes tokens |
 
-### Cross-cutting (not routes)
+### X · Cross-cutting (not routes)
 
 | ID | Component | Purpose |
 |---|---|---|
 | X1 | Loading / empty / error / offline | Every data screen has all four |
-| X2 | Session expired | Modal, sends to A2 |
+| X2 | Session expired | Modal → A2 |
 | X3 | 3DS challenge | Inbound VCAS push during a purchase |
-| X4 | Activity / notifications | Card frozen, card issued, transaction posted |
+| X4 | Activity / notifications | Card frozen, issued, transaction posted |
 
 ---
 
-## 1 · Entry flows
+## 5 · Access flows — everyone
 
 ```mermaid
 flowchart TD
     A1["A1 Splash"] --> Q{"Session?"}
     Q -->|none| A2["A2 Sign in"]
-    Q -->|"locked"| A5["A5 Unlock"]
-    Q -->|"valid"| N{"How many<br/>contexts?"}
-    A2 -->|ok| N
-    A5 -->|ok| N
-    N -->|one| H1["H1 Home"]
-    N -->|"more than one"| A7["A7 Choose context"] --> H1
-    A2 -->|"forgot password"| A6["A6 Can't sign in"]
-    Deep(["Invite link"]) --> A3["A3 Accept invite"] --> A4["A4 Set password"] --> N
+    Q -->|locked| A5["A5 Unlock"]
+    Q -->|valid| R{"Contexts?"}
+    A2 -->|ok| R
+    A5 -->|ok| R
+    R -->|"one — normal"| Role{"Role"}
+    R -->|"more than one"| A7["A7 Choose context"] --> Role
+    Role -->|CH| Ha["H1-a"]
+    Role -->|EC| Hb["H1-b"]
+    Role -->|CM| Hc["H1-c"]
+    Role -->|PM| Hd["H1-d"]
+    A2 -->|forgotten| A6["A6 Can't sign in"]
+    D(["Invite link"]) --> A3["A3 Accept invite"] --> A4["A4 Set password"] --> R
 ```
 
-**Cold launch, returning user, one context**
-`A1 → H1`
+**Returning user, one context** — `A1 → H1`
+**Locked** — `A1 → A5 → H1` · three biometric failures → `A5 → A2`
+**Session expired** — `A1 → A2 → H1`
+**First-time activation** — `invite → A3 → A4 → offer biometrics → H1`. The invite carries which account and which role, so a new user never sees A7.
+**Forgot password** — `A2 → A6 → out of app`. **No self-serve reset.** Support resets manually.
+**Session expires mid-use** — `any → X2 → A2 → back to the same screen`
+**Switch context** — `R1 → R4 → A7 → H1`
 
-**Cold launch, returning user, several contexts**
-`A1 → A7 → H1` — A7 remembers the last context and offers it first.
+### When does A7 appear?
 
-**Cold launch, session expired**
-`A1 → A2 → H1`
+Only when one person holds more than one context. Three real cases:
 
-**Cold launch, locked (backgrounded > 2 min)**
-`A1 → A5 → H1` · biometric fails 3× → `A5 → A2`
+- Works for **two companies** — an employee at each.
+- Is a **partner manager and a cardholder** — runs Acme's program and carries a personal card.
+- Is a **manager and holds a personal account** with us.
 
-**First-time activation from an invite**
-`invite email → A3 → A4 → (offer biometrics) → H1`
-The invite carries which account and which role. A new user never sees A7 — they have exactly one context.
-
-**Forgot password**
-`A2 → A6 → (out of app)` — **there is no self-serve reset.** Support resets it manually. This is a known gap, not a design choice.
-
-**Session expires mid-use**
-`any screen → X2 → A2 → back to the same screen`
-
-**Switch context**
-`R1 → R4 → A7 → H1` and also `H1 → context chip → A7 → H1`
+Within one company there is nothing to switch: one account, one role on it.
 
 ---
 
-## 2 · What each Home shows
+## 6 · CH · Cardholder — personal account
 
-```mermaid
-flowchart TD
-    H1["H1 Home"] --> V{"Your role in<br/>this context"}
-    V -->|"AC · additional customer"| Ha["My card<br/>What I spent<br/>Balance still available<br/>My recent activity"]
-    V -->|"PC · primary customer"| Hb["My card, if I hold one<br/>Account balance + limit<br/>Cards · People<br/>Account activity"]
-    V -->|"OA · org admin"| Hc["Consolidated balance<br/>Departments<br/>Cross-department activity"]
-
-    Ha --> Ta["Tabs: Home · Transactions · Profile"]
-    Hb --> Tb["Tabs: Home · Cards · People · Transactions · Profile"]
-    Hc --> Tc["Tabs: Home · Departments · Cards · People · Transactions · Profile"]
-```
-
-**The tab bar changes with the role.** An AC has three tabs and never sees Cards or People — not greyed out, *absent*. A disabled button that says "you can't do this" is an invitation to try; a missing tab is not.
-
-### What an AC sees on a shared-balance account
-
-Three numbers, and only three:
-
-| Shown | Not shown |
-|---|---|
-| **What I spent** on my card, this cycle | What anyone else spent |
-| **Balance still available** on the shared pool | Who consumed the rest of it |
-| **My transactions**, in full detail | Anyone else's transactions |
-
-The available balance is a property of the account, so it moves when a colleague spends. That is correct and it is the point — a driver needs to know whether there is money left before pulling up to a toll gate. They do not need to know which colleague spent it.
-
-> **One honest leak:** given the credit limit, the available balance, and their own spend, an AC can compute what *everyone else combined* has spent. They can never attribute it to a person. We accept this — hiding it would mean hiding the available balance, which defeats the feature.
-
-### A PC who also holds a card
-
-The common case, not the exception: a team lead manages the department and carries a company card on it. H1-b therefore has **two zones**, and the boundary between them is a security boundary:
-
-| Zone | Contains | Reveal |
-|---|---|---|
-| **My card** | The card issued to them | ✅ full PAN + CVV under step-up |
-| **The account** | Every card, every person, the ledger | ❌ absent on every card here |
-
-Same screen, one card's number readable and a dozen not. The rule is not "managers can't reveal" — it is **"you can only reveal a card issued to you"**, and it happens to bite hardest on the person with the most power. That is the correct place for it to bite.
-
-A PC with no card of their own simply has no first zone.
-
-### The second axis: program type
-
-**Role decides what you can see. Program type decides what the numbers mean.** The two compose — there is no separate "credit app".
-
-```mermaid
-flowchart TD
-    H1["H1 Home"] --> R{"Role"}
-    R --> P{"Program type<br/>of this account"}
-    P -->|"prepaid / debit"| Pre["Balance available<br/>What I / we spent"]
-    P -->|"credit"| Cr["Available credit<br/>Balance owed<br/><b>Amount due · due date</b>"]
-    Cr --> T7["T7 Amount due"]
-    T7 --> How["How to pay<br/>per deployment"]
-    Cr -.->|"if behind"| Del["Delinquency banner<br/>→ T6"]
-```
-
-| | Prepaid / debit | Credit |
-|---|---|---|
-| H1 headline | Balance available | Available credit **and** balance owed |
-| Cycle | none | Closing date, days remaining |
-| Obligation | none | Amount due, minimum, due date → **T7** |
-| N1 adds | — | Cycle, due date, interest to date |
-| T4 statements | A period of activity | A closed cycle with a due date and balance |
-| T6 | absent | Interest accruals, delinquency buckets |
-| Card blocked because… | frozen, cancelled | frozen, cancelled, **or account delinquent** |
-
-An AC on a credit account sees the obligation for the pool they draw on — amount due and due date — because it explains why their card may stop working. They still never see another person's spending.
-
-> **⚠ The app shows a bill it cannot pay.** Payment initiation is out of scope, so T7 displays the amount due and a per-deployment **"how to pay"** instruction — bank transfer, direct debit, or "your finance team settles this" — and no Pay button. This is the assumed answer, not a settled one: the alternative is bringing statement payment in as the single exception to the money-movement freeze. It is a much narrower flow than the deferred Part III, and it is the one place where read-only genuinely hurts the user. **Decide before credit ships.**
-
-| | AC | PC | OA |
-|---|:--:|:--:|:--:|
-| Home | ✅ | ✅ | ✅ |
-| Departments | — | — | ✅ |
-| Cards | — | ✅ | ✅ |
-| People | — | ✅ | ✅ |
-| Transactions | own card | account | tree |
-| Profile | ✅ | ✅ | ✅ |
-
----
-
-## 3 · Additional customer (AC) — every flow
-
-This is the smallest surface: one card, read it, protect it.
+The smallest surface. One account they own, their cards, full self-service, nothing to manage.
 
 ```mermaid
 flowchart LR
-    H1["H1 Home"] --> C2["C2 Card detail"]
-    C2 --> A8["A8 Step-up"] --> C3["C3 Reveal PAN/CVV"]
-    C2 --> C4["C4 Freeze sheet"]
+    H["H1-a Home"] --> C2["C2 Card detail"]
+    C2 --> A8["A8 Step-up"] --> C3["C3 Reveal"]
+    C2 --> C4["C4 Freeze"]
     C2 --> C11["C11 PIN"]
     C2 --> C12["C12 Add to wallet"]
     C2 --> C9["C9 Activate"]
-    C2 --> C13["C13 Delivery status"]
-    H1 --> T1["T1 Transactions"] --> T2["T2 Detail"]
-    H1 --> R1["R1 Profile"]
+    C2 --> C13["C13 Delivery"]
+    H --> T1["T1 Transactions"] --> T2["T2 Detail"]
+    H --> T4["T4 Statements"] --> T5["T5 Statement"]
+    H --> R1["R1 Profile"]
+
+    style C3 fill:#0A2540,color:#fff
 ```
 
-**See my card**
-`H1 → C2`
+**See my card** — `H1-a → C2`
+**Reveal number and CVV** — `H1-a → C2 → [Reveal] → A8 → C3 → auto-close 90 s → C2`
+**Freeze / unfreeze** — `H1-a → C2 → [Freeze] → C4 → confirm → C2`. No step-up: freezing is the *safe* action and friction here costs money.
+**Add to Apple Pay / Google Pay** — `H1-a → C2 → [Add to wallet] → A8 → C12 → OS sheet → C2`
+**Set or change PIN** — `H1-a → C2 → [PIN] → A8 → C11 → C2`
+**Track my card in the post** — `H1-a → C2 → C13`
+**Activate on arrival** — `H1-a → C2 → [Activate] → C9 → last 4 → C2`
+**Report lost** — `H1-a → C2 → [Report lost] → C4 freeze → support notified`
+**Transactions** — `H1-a → T1 → T2`, filter `T1 → T3 → T1`
+**Statements** — `H1-a → T4 → T5 → [Share PDF]`
+**What's due** *(credit)* — `H1-a → T7`
+**3DS during a purchase** — `push → X3 → approve/decline`
 
-**Reveal the full number and CVV**
-`H1 → C2 → [Reveal] → A8 step-up → C3 → auto-close after 90 s → C2`
-Own card only. Screenshots blocked. Countdown visible. Copy-to-clipboard clears itself.
-
-**Freeze my card**
-`H1 → C2 → [Freeze] → C4 sheet → confirm → C2 (frozen)`
-Reversible. No step-up — freezing is a *safe* action and friction here costs people money.
-
-**Unfreeze my card**
-`H1 → C2 → [Unfreeze] → C4 sheet → confirm → C2 (active)`
-
-**Track my physical card on its way to me**
-`H1 → C2 → C13` — ordered → embossed → shipped → delivered.
-
-**Activate a physical card**
-`H1 → C2 → [Activate] → C9 → enter last 4 → C2 (active)`
-
-**Set or change my PIN**
-`H1 → C2 → [PIN] → A8 step-up → C11 → C2`
-
-**Add to Apple Pay / Google Pay**
-`H1 → C2 → [Add to wallet] → A8 step-up → C12 → OS sheet → C2`
-
-**Review my transactions**
-`H1 → T1 → T2` · filter: `T1 → T3 → T1`
-
-**My statements**
-`H1 → T4 → T5 → [share PDF]`
-
-**See what's due** *(credit accounts only)*
-`H1 → T7` — the pool's amount due and due date, plus how it gets paid. No Pay button.
-
-**Report my card lost**
-`H1 → C2 → [Report lost] → C4 (freeze immediately) → notify PC`
-An AC **cannot cancel or replace their own card** — that is the manager's call. The app freezes it instantly and tells the manager. Freezing on the user's own authority is right; destroying an asset on their own authority is not.
-
-**A purchase triggers 3DS**
-`push → X3 challenge → approve/decline → dismissed`
-
-**Change my password**
-`R1 → R2 → confirm → stay signed in`
-
-**Sign out**
-`R1 → R5 → confirm → A2`
-
-**What an AC cannot reach at all:** C1, C5, C6, C7, C8, C10, C14, all of P, all of N, T6.
-They see C13 for their own card only.
+**Out of reach:** C1, C5–C8, C10, C14, all of P, all of K, N1, N4, T6.
 
 ---
 
-## 4 · Primary customer (PC) — card management
+## 7 · EC · Employee cardholder — company account
 
-Everything an AC can do with their own card, plus control of every card on the account.
+Identical to CH with one difference, and it is on the Home screen.
+
+### What an employee sees of a shared pool
+
+| Shown | Not shown |
+|---|---|
+| **What I spent** this cycle | What anyone else spent |
+| **Balance still available** in the pool | Who consumed the rest |
+| **My transactions**, in full | Anyone else's |
+
+The available balance moves when a colleague spends, and that is correct — a driver needs to know there is money left before pulling up to a toll gate. They do not need to know which colleague spent it.
+
+> **One honest leak:** from the limit, the available balance and their own spend, an employee can compute what *everyone else combined* spent. Never per person. Hiding it would mean hiding the available balance, which defeats the feature.
+
+**Different from CH:** an employee **cannot cancel or replace their own card** — that is the manager's call. Report-lost freezes instantly and notifies. Acting alone to *protect* an asset is right; acting alone to destroy one is not.
+
+---
+
+## 8 · CM · Company manager — one account, many people
+
+Everything an employee can do with their own card, plus control of the account.
+
+### Cards
 
 ```mermaid
 flowchart LR
-    H1["H1 Home"] --> C1["C1 Card list"]
-    C1 --> C2["C2 Card detail"]
-    C1 --> C6["C6 Issue card"] --> C7["C7 Result"] --> C2
-    C2 --> C4["C4 Freeze sheet"]
-    C2 --> C8["C8 Edit limit"]
+    H["H1-c Home"] --> C1["C1 Cards"]
+    C1 --> C6["C6 Issue"] --> C7["C7 Result"] --> C2["C2 Card detail"]
+    C1 --> C2
+    C2 --> C4["C4 Freeze"]
+    C2 --> C8["C8 Limit"]
     C2 --> C10["C10 Replace"]
-    C2 --> C5["C5 Cancel confirm"]
-    C2 --> A8["A8 Step-up"] --> C3["C3 Reveal · own card only"]
+    C2 --> C5["C5 Cancel"]
+    C2 --> A8["A8 Step-up"] --> C3["C3 Reveal · own only"]
 
     style C5 fill:#C0362C,color:#fff
+    style C3 fill:#0A2540,color:#fff
 ```
 
-**See every card on the account**
-`H1 → C1` — filterable by status and holder.
+**All cards on the account** — `H1-c → C1`
+**Issue a card** — `H1-c → C1 → [Issue] → C6 → A8 → C7 → C2`
+**Issue to someone not yet on the account** — `H1-c → P1 → [Invite] → P3 (tick "issue a card too") → on acceptance the card is issued`
+**Freeze anyone's card** — `H1-c → C1 → C2 → C4 → confirm`. The holder is notified — silently freezing a card is how you strand a driver at a toll gate.
+**Cancel a card** — `H1-c → C1 → C2 → C5 → type last 4 → A8 → C2`. **Irreversible**; Pismo termination statuses cannot return to active.
+**Replace a lost card** — `H1-c → C1 → C2 → C10 → confirm → old cancelled, new ordered → C13`
+**Change a card limit** — `H1-c → C1 → C2 → C8 → save`
+**Order a physical card** — `H1-c → C1 → C6 (physical) → C14 → A8 → C7 → C13`
+**Reveal** — only on a card issued to them. On anyone else's the action is **absent**.
 
-**Issue a card to someone**
-`H1 → C1 → [Issue] → C6 form → A8 step-up → C7 result → C2`
-Form: holder (must already be a customer on the account), virtual or physical, transaction limit, printed name, expiry.
-
-**Issue a card to someone not yet on the account**
-`H1 → P1 → [Invite] → P3 form (tick "issue a card too") → invite sent → on acceptance the card is issued`
-
-**Freeze anyone's card**
-`H1 → C1 → C2 → [Freeze] → C4 → confirm → C2 (frozen)`
-The holder is notified. Silently freezing someone's card is how you strand a driver at a toll gate.
-
-**Cancel a card**
-`H1 → C1 → C2 → [Cancel] → C5 → type the last 4 → A8 step-up → C2 (cancelled)`
-**Irreversible.** Pismo termination statuses cannot return to active. C5 says so, in those words.
-
-**Replace a lost card**
-`H1 → C1 → C2 → [Replace] → C10 → confirm → old cancelled, new issued → C7 → C2`
-
-**Change a card's limit**
-`H1 → C1 → C2 → [Limit] → C8 → save → C2`
-
-**Reveal a card's number**
-`H1 → C1 → C2 → [Reveal] → only if it is your own card`
-On someone else's card the Reveal action is **absent**. A PC can freeze, cancel and replace a contractor's card; a PC cannot read its number. See the reveal rule in the feature list.
-
-### Physical cards
-
-In scope. A physical card has a life before it works and a life after it is lost, and both need screens.
-
-**Order a physical card for someone**
-`H1 → C1 → [Issue] → C6 (type: physical) → C14 delivery details → A8 step-up → C7 → C13`
-C14 collects embossed name, delivery address and courier. The card exists in Pismo from this moment but cannot transact until activated.
-
-**Track a card in production or transit**
-`H1 → C1 → C2 → C13` — ordered → embossed → shipped → delivered → activated.
-The cardholder sees C13 for their own card too. "Where is my card" is the single most common support call in card programs, and it is answerable in-app for free.
-
-**The cardholder activates it on arrival**
-`H1 → C2 → [Activate] → C9 → last 4 → C2 (active)` then `C2 → A8 → C11` to set a PIN.
-
-**A card is lost**
-AC: `H1 → C2 → [Report lost] → C4 freeze → PC notified`
-PC: `H1 → C1 → C2 → [Replace] → C10 → confirm → old cancelled, new ordered → C13`
-Freeze first, replace second. The freeze is instant and reversible in case it turns up in a coat pocket; the replacement cancels irreversibly, so it is the manager's decision and it happens later.
-
-**A card expires**
-Reissue ahead of the expiry date, same path as replace. The list at C1 flags cards expiring within 60 days.
-
-> **Backend reality check.** `CreateCardDto` accepts `type: PHYSICAL` and `pin_length`, so issuance works today. **Activation, PIN management, reissuing and any delivery tracking are all absent from the gateway** — reissuing exists in Pismo unproxied, and delivery status may not exist at all depending on the card bureau. C9, C10, C11, C13 and C14 are the least backed screens in this document.
-
----
-
-## 5 · Primary customer (PC) — people
+### People
 
 ```mermaid
 flowchart LR
-    H1["H1 Home"] --> P1["P1 People"]
-    P1 --> P2["P2 Person detail"]
-    P1 --> P3["P3 Invite"] --> P4["P4 Pending invites"]
+    H["H1-c Home"] --> P1["P1 Employees"]
+    P1 --> P2["P2 Detail"]
+    P1 --> P3["P3 Invite"] --> P4["P4 Pending"]
+    P1 --> P8["P8 Labels"]
     P2 --> P5["P5 Remove"]
-    P2 --> P6["P6 Promote / demote"]
-    P2 --> C6["C6 Issue card to them"]
+    P2 --> P6["P6 Role"]
+    P2 --> P7["P7 Spending limit"]
+    P2 --> C6["C6 Issue card"]
     P2 --> T1["T1 Their transactions"]
 
     style P5 fill:#C0362C,color:#fff
 ```
 
-**See who is on the account**
-`H1 → P1`
+**See who is on the account** — `H1-c → P1`
+**Add someone** — `H1-c → P1 → [Invite] → P3 → send → P4`. They land in `A3 → A4`.
+**Chase or cancel an invite** — `H1-c → P1 → P4 → [Resend] / [Revoke]`
+**One person's cards and spending** — `H1-c → P1 → P2`, then `→ T1`
 
-**Add someone**
-`H1 → P1 → [Invite] → P3 → send → P4`
-They receive the deep link and land in `A3 → A4`.
-
-**Chase or cancel an invite**
-`H1 → P1 → P4 → [Resend] or [Revoke]`
-
-**See one person's cards and spending**
-`H1 → P1 → P2` → their cards inline, `→ T1` for their activity
-
-**Remove someone who has left the organization**
-`H1 → P1 → P2 → [Remove] → P5 → type their name → A8 step-up → P1`
+**Remove someone who has left** — `H1-c → P1 → P2 → [Remove] → P5 → type their name → A8 → P1`
 
 A card is issued *to a person*. If the person is gone, the card is gone:
+- Every card issued to them is **cancelled** — irreversible.
+- Their **transaction history stays**, for monitoring and audit.
+- They lose the context immediately.
 
-- Every card issued to them is **cancelled** — a Pismo termination status, which cannot be reversed.
-- Their **transaction history stays**, attached to the account, for monitoring and audit.
-- They lose the context immediately. Next launch, it is absent from A7.
+> ⚠ **`is_active` is not an off-switch.** Pismo documents it as *"informative only. There are no restrictions that prevent inactive customers from performing any actions."* Cutting off a departed employee means cancelling cards and revoking the session — never just flipping that flag.
 
-P5 lists the cards by last-4 and says plainly that cancelling cannot be undone. Removing a person and destroying their cards are one action, and the confirm screen must not pretend otherwise.
+> **Retention vs erasure.** Keeping a departed employee's merchant-level history indefinitely is right for monitoring and wrong under some data-protection regimes. The usual resolution is a retention period after which records are anonymised — the ledger keeps its integrity, the person stops being identifiable. **Someone must set that period.**
 
-> **Retention vs. erasure.** Keeping a departed employee's merchant-level history indefinitely is the right call for financial monitoring and the wrong one under some data-protection regimes, which grant erasure rights over exactly this data. The resolution is normally a defined retention period after which records are anonymised rather than deleted — the ledger keeps its integrity, the person stops being identifiable. **Someone needs to set that period.** It is not a screen; it is a policy the backend enforces.
+**Promote someone to manager** — `H1-c → P1 → P2 → [Promote] → P6 → A8 → P2`
 
-**Promote someone to primary customer**
-`H1 → P1 → P2 → [Promote] → P6 → A8 step-up → P2`
+Additive; nothing is taken away. They keep their customer record, keep their card, keep reveal rights on it, and gain manager scope. The promoter keeps everything. **One account, one role** — A7 gains no row, the card never moves.
 
-A PC can promote, without going to the OA. Promotion is **additive** and nothing is taken away:
+**Demote** — `→ P6 → confirm`. They stay an employee with their card intact. A manager cannot demote the last remaining manager.
 
-- They **keep** their customer record on the account.
-- They **keep** their card, and their own reveal rights on it.
-- They **gain** manager scope: every card, every person, the account ledger.
-- The promoter keeps everything they had. Nobody is demoted to make room.
+### Budgets and labels
 
-**The card is bound to the person, so it travels with them.** They do not become a manager *instead of* a cardholder — they become a manager *who holds a card on the account they manage*. That is the normal state for a team lead carrying a company card, not an edge case.
+**Set what one employee may spend** — `H1-c → P1 → P2 → [Spending limit] → P7 → save`
 
-**One account, one role.** A7 lists one row per **account**, and promotion changes the role on that row rather than adding a second row. There is no hat-switching within a single account — the PC context already contains their own card, with full reveal rights on it, alongside everyone else's cards which they can manage but never reveal.
+P7 writes a Pismo *customer flex control*: an amount, a period (`limit_duration`), a reset cadence (`reset_period`). Types are `spending_limit` (value) and `usage_limit` (count). **The type cannot be changed after creation** — P7 must create the right kind first time, or replace rather than edit.
 
-Dual contexts happen **across** accounts, not within one. See section 9.
+**Group employees into a department** — `H1-c → P1 → P8`
 
-**Demote someone**
-`H1 → P1 → P2 → [Demote] → P6 → confirm → P2`
-Removes the manager row. They remain an AC with their card intact. A PC cannot demote the last remaining PC of an account — N1 would become unmanageable.
+A label in our system. It filters lists, groups reporting, and carries a default limit for new joiners. **It is not a Pismo object and does not partition the balance.** A group budget is a bulk write of one flex control per employee, and a new joiner inherits nothing automatically — our system applies the label's limit on invite.
 
-**Give someone a card but not control**
-Default. Every invited person is an AC until promoted.
+### Account and money
 
----
+**Account position** — `H1-c → N1` · **health** — `H1-c → N1 → N4`
+**Whole-account ledger** — `H1-c → T1`, filter by person or label via `T3`
+**Statements** — `H1-c → T4 → T5` · **interest & arrears** *(credit)* — `H1-c → N1 → T6` · **amount due** — `H1-c → T7`
 
-## 6 · Primary customer (PC) — account & money view
+### What a manager cannot do
 
-```mermaid
-flowchart LR
-    H1["H1 Home"] --> N1["N1 Account overview"]
-    H1 --> T1["T1 Transactions"] --> T2["T2 Detail"]
-    T1 --> T3["T3 Filters"]
-    H1 --> T4["T4 Statements"] --> T5["T5 Statement"]
-    N1 --> T6["T6 Interest & arrears"]
-    H1 --> T7["T7 Amount due<br/>credit only"]
-```
-
-**Check the account balance and limit**
-`H1 → N1`
-
-**Review the whole account ledger**
-`H1 → T1` — every card, every person. Filter by person: `T1 → T3 → T1`
-
-**Investigate one transaction**
-`H1 → T1 → T2` — shows which card and which person.
-
-**Pull a statement**
-`H1 → T4 → T5 → [Share PDF]`
-
-**Check interest and arrears** *(credit only)*
-`H1 → N1 → T6`
-
-**Check what the account owes and when** *(credit only)*
-`H1 → T7` — balance owed, minimum payment, due date, days remaining, how to pay.
-
-**The account has fallen behind** *(credit only)*
-`H1 → delinquency banner → T6 buckets → T1 filtered to unpaid`
-Delinquency blocks cards at the account level, so C2 must explain *why* a card is not working — "account overdue", not a bare "blocked". A cardholder stranded at a toll gate needs the real reason, and it is not their card's fault.
-
----
-
-## 7 · Organization admin (OA) — the tree
-
-Everything a PC can do, on every account below them, plus opening accounts and appointing managers.
-
-```mermaid
-flowchart LR
-    H1["H1 Home · org"] --> N2["N2 Departments"]
-    N2 --> N1["N1 Account overview"]
-    N1 --> C1["C1 Cards"]
-    N1 --> P1["P1 People"]
-    N1 --> N5["N5 Account settings"]
-    N2 --> N3["N3 Open new account"] --> N4["N4 Application status"] --> N1
-    P1 --> P2["P2 Person"] --> P6["P6 Change role"]
-    H1 --> T1["T1 All transactions"]
-    H1 --> N6["N6 Organization policies"]
-
-    style N6 fill:#0A2540,color:#fff
-```
-
-**See all departments and consolidated balance**
-`H1 → N2`
-
-**Drill into one department**
-`H1 → N2 → N1` — from here every PC flow in sections 4–6 applies to that account.
-
-**Open a new department account**
-`H1 → N2 → [New] → N3 form → submit → N4 pending → approved → N1`
-
-**Chase an application**
-`H1 → N2 → N4`
-
-**Appoint a department manager**
-`H1 → N2 → N1 → P1 → P2 → [Promote] → P6 → A8 step-up → P2`
-Same flow a PC uses, applied to any account in the tree.
-
-**Set organization-wide policy**
-`H1 → N6 → toggle → A8 step-up → N6`
-
-Policies live on the parent account and are **inherited by every child account**. A department PC sees the effect and cannot override it. The first one we need:
-
-| Policy | Default | Effect when off |
+| Action | Why | Where |
 |---|---|---|
-| **Managers may see cardholders' transaction detail** | On | PC and OA see amount, date, card and status — **merchant name and location are hidden**. The transaction still appears; it is redacted, not missing. |
-
-That is the answer to the employee-surveillance question: on by default because the manager holds the budget, switchable off by the organization because in some jurisdictions merchant-level visibility into an employee's spending is regulated. **It must be enforced server-side** — the redacted fields have to be absent from the response, not hidden by the client. A policy the app enforces is a policy anyone with a proxy can turn back on.
-
-Room for more later: whether PCs may promote, whether reveal is allowed at all, statement retention, default card limits.
-
-**Walk a hierarchy deeper than three levels**
-`H1 → N2 → N1 → [Sub-departments] → N2 → …`
-
-Pismo's structure is **not depth-limited** — `parent_account_id` is a plain field, so accounts nest as deep as a corporation needs. The limit is on the convenience endpoint: *Get related accounts* returns parent + children + grandchildren, **three levels**, and it returns them as a **flat array** with the parent-child links stripped out.
-
-Two consequences for us:
-
-1. Even inside three levels, we cannot render a tree from that response — we have to rebuild it from each account's `parent_account_id`.
-2. Beyond three levels, we walk: call the endpoint again from each grandchild.
-
-So the backend keeps its own account-tree index, built from `parent_account_id` and kept in step by webhooks. Then N2 renders any depth from one query of our own, and *Get related accounts* becomes a source for balances rather than the thing we navigate with. Arbitrary depth is achievable — it just isn't free.
-
-**Block or close a department account**
-`H1 → N2 → N1 → N5 → change status → confirm`
-Blocking an account blocks every card on it. N5 must show the count before confirming.
-
-**Change a department's credit limit or billing day**
-`H1 → N2 → N1 → N5 → save`
-
-**Look across all departments at once**
-`H1 → T1` — unfiltered, whole tree. `T3` filters by department.
+| Open an account | Underwriting act | Back-office |
+| Change the credit limit | Underwriting decision | Back-office |
+| Change account status | Blocks every card at once; needs a reason code | Back-office |
+| Set the transaction-visibility policy | A manager switching off their own oversight is self-limiting | Per-org config |
 
 ---
 
-## 8 · Everyone — profile & settings
+## 9 · PM · Partner manager — one program, many accounts
+
+**New.** A partner issues cards under their own brand, in their own program, to their own end-customers. Their unit of management is the **account**, not the customer — each end-customer has their own account and their own balance.
+
+```mermaid
+flowchart LR
+    H["H1-d Home · program"] --> K5["K5 Program overview"]
+    H --> K1["K1 Accounts"]
+    K1 --> K2["K2 Account summary"]
+    K1 --> K3["K3 Onboard account"] --> K4["K4 Application status"] --> K2
+    K2 --> C1["C1 Cards on it"]
+    C1 --> C2["C2 Card detail"]
+    C2 --> C4["C4 Freeze"]
+    C2 --> C5["C5 Cancel"]
+    C2 --> C10["C10 Replace"]
+    C2 -.->|"Reveal ❌ never"| X["consumer PAN"]
+    H --> T1["T1 Program transactions<br/>masked by default"]
+    H --> K6["K6 Program settings · read-only"]
+
+    style X fill:#C0362C,color:#fff
+    style K1 fill:#0A2540,color:#fff
+```
+
+**Program at a glance** — `H1-d → K5` — accounts open, active cards, total balances, delinquency count, cards expiring.
+**Browse the portfolio** — `H1-d → K1`, filter by status, balance, card state.
+**Look at one account** — `H1-d → K1 → K2` — status, balance, holder, cards. Masked throughout.
+**Onboard a new end-customer** — `H1-d → K1 → [Onboard] → K3 → submit → K4 pending → approved → K2`
+**Chase an application** — `H1-d → K1 → K4`
+**Issue a card on an account** — `H1-d → K1 → K2 → C1 → C6 → C7`
+**Freeze / cancel / replace a card** — `H1-d → K1 → K2 → C1 → C2 → C4 / C5 / C10`
+**Program-wide reporting** — `H1-d → T1`, `T3` filters by account, status or date.
+**Program configuration** — `H1-d → K6`. **Read-only.** Type, currency, brand, program limits and due dates are set with us at onboarding.
+
+### The two hard rules for partners
+
+**1 · A partner never reveals an end-customer's card number.** Not masked-with-a-button, not audited-and-allowed. The action does not exist on K2 or on any card reached through it. Their end-customers are consumers who gave their details to a card programme, not employees on a company budget.
+
+**2 · Transaction detail is masked by default.** T1 in program scope shows amount, date, card and status. Merchant name and location are **absent from the response**, not hidden by the client. A partner sees that an account is spending and whether it is healthy — not what a consumer bought and where.
+
+Turning either on is a per-program decision with a compliance conversation attached. Neither is a toggle we ship in the on position.
+
+### What a partner manager cannot do
+
+| Action | Where |
+|---|---|
+| Reveal any end-customer PAN | **Nowhere.** Not available to anyone but the cardholder |
+| Change program type, currency, brand | Back-office, at onboarding |
+| Change program limits or due dates | Back-office |
+| Create a program | Back-office |
+| See merchant-level consumer detail | Off unless enabled per program |
+
+### ⚠ The portfolio view has no Pismo endpoint
+
+There is **no "list all accounts in a program" endpoint.** Account search is by **document number** or **phone number**, with an optional `program_ID` filter — you must already know who you are looking for.
+
+So **K1 and K5 cannot be built from Pismo directly.** Our backend maintains its own index of accounts per program, populated at onboarding and kept current by account and card webhooks. Pismo stays the source of truth for each account's balance and status; the *list* is ours.
+
+This is the largest new piece of backend work the partner use case introduces, and it is not optional — K1 is the partner's home screen.
+
+---
+
+## 10 · Everyone — profile & settings
 
 ```mermaid
 flowchart LR
@@ -584,140 +516,139 @@ flowchart LR
     R1 --> R5["R5 Sign out"]
 ```
 
-**Change my password** — `R1 → R2 → save` · stays signed in, other devices signed out
-**Turn biometrics on or off** — `R1 → R3 → toggle → A8 step-up → R3`
-**Notification preferences** — `R1 → R3`
-**See every context I hold** — `R1 → R4` — read-only, shows each `(organization · account · role)`
+**Change password** — `R1 → R2 → save`. Stays signed in; other devices signed out.
+**Biometrics on/off** — `R1 → R3 → toggle → A8 → R3`
+**Notifications** — `R1 → R3`
+**See every context I hold** — `R1 → R4`
 **Switch context** — `R1 → R4 → A7 → H1`
 **Sign out** — `R1 → R5 → confirm → A2`
 
 ---
 
-## 9 · The dual-hat case, end to end
+## 11 · Two hats
 
-**Two hats means two accounts, never two roles on one account.** Within a single account you have exactly one role, and if you hold a card there it comes with that role.
+Two contexts means **two accounts or two programs — never two roles on one account.** Within a single account you have exactly one role, and any card you hold comes with it.
 
-The scenario from the brief, as an actual click path.
+### Case A — a manager who also carries a card (common)
 
-> Lee Wing holds a card on **Apple · Managers team** and runs **Apple · Contractors**, where they also carry a card of their own.
+One account, one role, **two zones on one screen**.
 
 ```mermaid
 flowchart TD
-    A2["A2 Sign in"] --> A7["A7 Choose context<br/>one row per account"]
-    A7 -->|"Apple · Managers team<br/>Additional customer"| Ha["H1-a Home<br/>3 tabs"]
-    A7 -->|"Apple · Contractors<br/>Primary customer"| Hb["H1-b Home<br/>5 tabs"]
+    H["H1-c Home · manager"] --> Mine["<b>My card</b> 4417"] --> C3["C3 Reveal ✅"]
+    H --> C1["C1 All cards · 12 employees"] --> C2["C2 An employee's card"]
+    C2 --> F["Freeze ✅ · Cancel ✅ · Limit ✅ · Replace ✅"]
+    C2 -.->|"Reveal ❌ absent"| X["not issued to them"]
 
-    Ha --> C2a["C2 My card"] --> C3a["C3 Reveal ✅"]
-
-    Hb --> Mine["My card<br/>on this account"] --> C3b["C3 Reveal ✅"]
-    Hb --> C1["C1 All contractor cards"] --> C2b["C2 A contractor's card"]
-    C2b --> Fr["Freeze ✅ · Cancel ✅ · Limit ✅ · Replace ✅"]
-    C2b -.->|"Reveal ❌ absent"| X["not issued to them"]
-
-    Ha -.->|"switch"| A7
-    Hb -.->|"switch"| A7
-
-    style C3a fill:#0A2540,color:#fff
-    style C3b fill:#0A2540,color:#fff
+    style C3 fill:#0A2540,color:#fff
     style X fill:#C0362C,color:#fff
 ```
 
-`A2 → A7 → [Apple · Managers team] → H1-a` — three tabs, one card, full reveal rights on it.
-`R1 → R4 → A7 → [Apple · Contractors] → H1-b` — five tabs. Their own card is here too, revealable. The twelve contractor cards beside it are fully manageable and not revealable.
+No switching. The boundary is not between hats — it is between **their card** and **everyone else's**, on one screen, under one role.
 
-**One context is active at a time, and one role per account.** No merged view across accounts. Inside the Contractors context, the boundary is not between two hats — it is between *their card* and *everyone else's*.
+### Case B — a partner manager who also holds a card
 
-### What promotion actually changed
+```mermaid
+flowchart TD
+    A2["A2 Sign in"] --> A7["A7 Choose context"]
+    A7 -->|"Acme programme · Partner manager"| Hd["H1-d · 5 tabs<br/>800 accounts, no reveal anywhere"]
+    A7 -->|"My own card · Cardholder"| Ha["H1-a · 3 tabs<br/>my card, revealable"]
+    Hd -.->|switch| A7
+    Ha -.->|switch| A7
+```
 
-Say Lee Wing started as an ordinary contractor with a card, and was promoted to run the department:
+The same human runs a programme of 800 consumer accounts and holds one personal card. In the programme they may never reveal a number; in their own account they may reveal theirs. **One context active at a time**, nothing crosses.
+
+### What promotion changes
+
+An employee with card 4417 is promoted to manager:
 
 | | Before | After |
 |---|---|---|
-| Rows in A7 for Contractors | 1 | **1** — unchanged |
-| Role on that row | Additional customer | Primary customer |
-| Their card | Card ending 4417 | **Card ending 4417** — same card |
+| Accounts they appear on | 1 | **1** |
+| Rows in A7 | 0 — picker skipped | **0** |
+| Role | Employee | Manager |
+| Their card | 4417 | **4417** |
 | Reveal on it | ✅ | ✅ |
-| Other people's cards | invisible | manageable, not revealable |
+| Others' cards | invisible | manageable, never revealable |
 | Tabs | 3 | 5 |
 
-Nothing was cancelled, reissued, or vacated. One row changed value; the card never moved.
+Nothing cancelled, reissued or vacated. The card is bound to the person; only the role changes.
 
 ---
 
-## 10 · Coverage check
-
-Every action in the app, and the shortest path to it.
+## 12 · Coverage
 
 | Action | Who | Path |
 |---|---|---|
-| See my card | AC PC OA | `H1 → C2` |
+| See my card | CH EC CM | `H1 → C2` |
 | Reveal number & CVV | own card | `H1 → C2 → A8 → C3` |
-| Freeze my card | AC PC OA | `H1 → C2 → C4` |
-| Freeze someone's card | PC OA | `H1 → C1 → C2 → C4` |
-| Cancel a card | PC OA | `H1 → C1 → C2 → C5` |
-| Issue a card | PC OA | `H1 → C1 → C6 → C7` |
-| Replace a lost card | PC OA | `H1 → C1 → C2 → C10` |
-| Change a card limit | PC OA | `H1 → C1 → C2 → C8` |
-| Order a physical card | PC OA | `H1 → C1 → C6 → C14 → C7` |
-| Track a card in transit | AC PC OA | `H1 → C2 → C13` |
-| Activate physical card | AC PC | `H1 → C2 → C9` |
-| Set PIN | AC | `H1 → C2 → A8 → C11` |
-| Add to wallet | AC | `H1 → C2 → A8 → C12` |
-| Report card lost | AC | `H1 → C2 → C4` (freeze + notify) |
-| See who is on the account | PC OA | `H1 → P1` |
-| Invite a person | PC OA | `H1 → P1 → P3` |
-| Remove a person | PC OA | `H1 → P1 → P2 → P5` |
-| Promote to PC | PC OA | `H1 → P1 → P2 → P6` |
-| Demote a PC | PC OA | `H1 → P1 → P2 → P6` |
-| Account balance & limit | PC OA | `H1 → N1` |
-| Open a department account | OA | `H1 → N2 → N3 → N4` |
-| Block / close an account | OA | `H1 → N2 → N1 → N5` |
-| See departments | OA | `H1 → N2` |
-| Set org-wide policy | OA | `H1 → N6` |
-| My transactions | AC | `H1 → T1` |
-| Account transactions | PC OA | `H1 → T1` |
-| Filter transactions | all | `T1 → T3` |
-| Transaction detail | all | `T1 → T2` |
-| Statements | all | `H1 → T4 → T5` |
-| Interest & arrears *(credit)* | PC OA | `H1 → N1 → T6` |
-| Amount due & how to pay *(credit)* | AC PC OA | `H1 → T7` |
+| Freeze my card | CH EC CM | `H1 → C2 → C4` |
+| Add to wallet | CH EC | `H1 → C2 → A8 → C12` |
+| Set PIN | CH EC | `H1 → C2 → A8 → C11` |
+| Activate physical card | CH EC | `H1 → C2 → C9` |
+| Track card in transit | CH EC CM PM | `H1 → C2 → C13` |
+| Report card lost | CH EC | `H1 → C2 → C4` |
+| My transactions | CH EC | `H1 → T1 → T2` |
+| My statements | CH EC | `H1 → T4 → T5` |
+| Amount due *(credit)* | CH EC CM PM | `H1 → T7` |
+| All cards in scope | CM PM | `H1 → C1` |
+| Issue a card | CM PM | `H1 → C1 → C6 → C7` |
+| Order a physical card | CM PM | `H1 → C1 → C6 → C14 → C7` |
+| Freeze someone's card | CM PM | `H1 → C1 → C2 → C4` |
+| Cancel a card | CM PM | `H1 → C1 → C2 → C5` |
+| Replace a lost card | CM PM | `H1 → C1 → C2 → C10` |
+| Change a card limit | CM PM | `H1 → C1 → C2 → C8` |
+| See employees | CM | `H1 → P1` |
+| Invite an employee | CM | `H1 → P1 → P3` |
+| Remove an employee | CM | `H1 → P1 → P2 → P5` |
+| Promote / demote | CM | `H1 → P1 → P2 → P6` |
+| Set a spending limit | CM | `H1 → P1 → P2 → P7` |
+| Manage labels | CM | `H1 → P1 → P8` |
+| Account position | CM PM | `H1 → N1` |
+| Account health | CM PM | `H1 → N1 → N4` |
+| Account ledger | CM | `H1 → T1` |
+| Interest & arrears *(credit)* | CM PM | `H1 → N1 → T6` |
+| Program overview | PM | `H1 → K5` |
+| Browse accounts | PM | `H1 → K1` |
+| One account summary | PM | `H1 → K1 → K2` |
+| Onboard an end-customer | PM | `H1 → K1 → K3 → K4` |
+| Program settings | PM | `H1 → K6` *(read-only)* |
+| Program-wide transactions | PM | `H1 → T1` *(masked)* |
 | Change password | all | `R1 → R2` |
-| Biometrics on/off | all | `R1 → R3` |
-| See my contexts | all | `R1 → R4` |
 | Switch context | multi | `R1 → R4 → A7` |
 | Sign out | all | `R1 → R5` |
-| Reset forgotten password | all | `A2 → A6` → **manual, out of app** |
+| Reset forgotten password | all | `A2 → A6` → **manual** |
+| Open an account / change its limit | — | **back-office** |
 
 ---
 
-## Decisions, settled 2026-08-17
+## 13 · Decisions
 
 | # | Question | Decision |
 |---|---|---|
-| 1 | What does an AC see on a shared-balance account? | **Own card only** — their own transactions, their own spend, and the pool's available balance. Never another person's activity. |
-| 2 | Can a PC see an AC's transaction detail? | **Yes by default, switchable off org-wide** by an OA at N6. Off means merchant name and location are redacted, server-side. |
-| 3 | How deep can the hierarchy go? | **Any depth.** `parent_account_id` is unlimited; only *Get related accounts* stops at three levels and flattens them. We keep our own tree index. |
-| 4 | Does removing a person cancel their cards? | **Yes, irreversibly.** Transaction history is retained for monitoring. A retention/anonymisation period still needs setting. |
-| 5 | Who can promote to PC? | **Any PC of that account**, no OA needed. A card is bound to the person it was issued to, so promotion changes only their role — same card, same reveal rights, one context. |
-| 6 | Physical cards? | **In scope.** Order, track, activate, PIN, replace, reissue. |
-| 7 | Which program types? | **Credit as well as prepaid/debit.** Program type is a second axis alongside role — same permissions, different numbers. |
+| 1 | What does an employee see on a shared pool? | Own transactions, own spend, pool available. Never another person's activity. |
+| 2 | Can a company manager see employee transaction detail? | **Yes by default**, switchable off per org. Redaction is server-side. |
+| 3 | Can a partner manager see end-customer transaction detail? | **No by default.** Masked. Enabling it is a per-program compliance decision. |
+| 4 | Can a partner reveal an end-customer PAN? | **Never.** The action does not exist. |
+| 5 | Does removing a person cancel their cards? | **Yes, irreversibly.** History retained; retention period TBD. |
+| 6 | Who can promote to manager? | Any manager of that account. Additive — same card, same rights, one context. |
+| 7 | Physical cards? | **In scope.** Order, track, activate, PIN, replace, reissue. |
+| 8 | Program types? | **Credit, debit and prepaid.** Voucher exists and a partner may want one. |
+| 9 | How are departments represented? | A label plus a per-employee flex control. Not accounts. |
+| 10 | How is a partner represented? | **A program** inside our org. Not a sub-org, not a parent account. |
+| 11 | What does a login map to? | A Pismo **entity**. One entity → one customer per account. Our own table, not entity search. |
 
-### The one thing decision 5 required changing
+## 14 · Still open
 
-The brief's mechanics were that a promoted person "loses access to the AC account and gains access to PC", vacating a seat that a new person could fill with no cards attached.
-
-That would have cost the promoted person their card — and a team lead who manages the contractors while also carrying a company card is the exact dual-hat case in section 9. Losing the card on promotion contradicts it.
-
-The cause was an overloaded term: **PC was standing in for Pismo's account owner**, and Pismo permits exactly one of those, so adding a second looked impossible. Separating them removes the constraint entirely — Pismo's owner becomes the *company*, PC becomes a row in our own table, and any number of people can hold it. Promotion then adds a row and takes nothing away. The intent — a PC can promote without escalating to the OA — is preserved exactly.
-
-## Still open
-
-1. **How does a credit statement get paid?** The app shows the amount due and cannot discharge it. Default assumption: a per-deployment "how to pay" instruction on T7. The alternative — bringing statement payment in as the one exception to the money-movement freeze — is narrow enough to be worth considering. **Blocks credit shipping, not credit building.**
-2. **Retention period** for a departed person's transaction history before anonymisation. Legal, not product.
-3. **Does the OA policy set at N6 also cover reveal?** Whether an organization can switch off PAN reveal entirely for its cardholders.
-4. **Delivery tracking depth** for physical cards — depends on what the card bureau exposes, which is not in the gateway at all.
-5. **Can a PC promote someone to PC of a *child* account they don't manage?** Assumed no. Only within their own account, or anywhere in the tree if they are an OA.
+1. **How does a credit statement get paid?** The app shows the amount due and cannot discharge it. Default: a per-deployment "how to pay" line on T7. The alternative is statement payment as the one exception to the money-movement freeze. **Blocks credit shipping, not credit building.**
+2. **Retention / anonymisation period** for a departed person's history. Legal, not product.
+3. **Can a partner manager freeze and cancel end-customer cards at all?** Assumed yes — a partner running a card programme needs fraud response. But it is real power over a consumer's money, and it may need a reason code and an audit trail rather than a bare confirm.
+4. **Does a partner ever need PAN access for support?** Assumed never. If their support desk genuinely needs to verify a card, the answer is last-4 confirmation, not reveal.
+5. **Can one partner run several programs?** Structurally yes — an org holds many programs. Whether PM scope is one program or a set of them changes K1 and K5.
+6. **Delivery-tracking depth** for physical cards — depends on the card bureau, which is not in the gateway at all.
+7. **Is there a floor on managers?** A manager cannot demote the last one. Whether a company may run with zero in-app managers is undecided.
 
 ---
 
-*Screen IDs here are new and do not map to the S1–S26 numbering in `card-app-complete-spec.md`. That document describes the single-cardholder app; this one describes the multi-role app that supersedes it.*
+*Screen IDs are this document's own and do not map to the S1–S26 numbering in `card-app-complete-spec.md`, which describes the single-cardholder app this supersedes.*
